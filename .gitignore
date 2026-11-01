@@ -1,0 +1,20 @@
+.DS_Store
+.azure/
+.azure-local.json
+*.local.json
+.env
+.env.*
+!.env.example
+
+# Signing material must never enter this repository.
+*.cer
+*.key
+*.mobileprovision
+*.p12
+*.pem
+secrets/
+
+# PowerShell tooling
+TestResults/
+testResults.xml
+coverage.xml
