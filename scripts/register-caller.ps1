@@ -134,7 +134,7 @@ try {
         ) -StandardInput '{}' -AllowEmpty | Out-Null
     }
 
-    # gh secret set reads the value from standard input when --body is omitted, keeping
+    # gh variable set reads the value from standard input when --body is omitted, keeping
     # identifiers out of process arguments and repository content.
     $githubValues = @{
         AZURE_CLIENT_ID     = "$($app.appId)"

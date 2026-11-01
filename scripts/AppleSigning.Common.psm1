@@ -17,6 +17,8 @@ function Invoke-Tool {
         [Parameter(Mandatory)][string] $Name,
         [Parameter(Mandatory)][string[]] $Arguments,
         [AllowEmptyString()][string] $StandardInput,
+        [string] $WorkingDirectory,
+        [hashtable] $Environment,
         [switch] $Sensitive,
         [switch] $AllowEmpty
     )
@@ -29,6 +31,14 @@ function Invoke-Tool {
     $startInfo.RedirectStandardError = $true
     $hasStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
     $startInfo.RedirectStandardInput = $hasStandardInput
+    if ($WorkingDirectory) {
+        $startInfo.WorkingDirectory = $WorkingDirectory
+    }
+    if ($Environment) {
+        foreach ($entry in $Environment.GetEnumerator()) {
+            $startInfo.Environment[$entry.Key] = "$($entry.Value)"
+        }
+    }
     foreach ($argument in $Arguments) {
         $startInfo.ArgumentList.Add($argument)
     }
@@ -125,7 +135,11 @@ function Resolve-ManagedVault {
     param([string] $VaultName)
 
     if ($VaultName) {
-        return Invoke-AzJson -Arguments @('keyvault', 'show', '--name', $VaultName)
+        $vault = Invoke-AzJson -Arguments @('keyvault', 'show', '--name', $VaultName)
+        if (-not (Test-ManagedResource -Resource $vault)) {
+            throw "Vault '$VaultName' exists without the required ownership tags."
+        }
+        return $vault
     }
 
     $vaults = @(Find-ManagedVault)
@@ -133,20 +147,27 @@ function Resolve-ManagedVault {
         throw 'No managed signing vault was found in the active subscription. Run provision-azure.ps1 first.'
     }
     if ($vaults.Count -eq 1) {
-        return $vaults[0]
+        $VaultName = $vaults[0].name
+    }
+    else {
+        Write-Information 'Select a managed signing vault:' -InformationAction Continue
+        for ($index = 0; $index -lt $vaults.Count; $index++) {
+            Write-Information "[$($index + 1)] $($vaults[$index].name) ($($vaults[$index].resourceGroup))" -InformationAction Continue
+        }
+        $selection = Read-Host 'Selection'
+        $number = 0
+        if (-not [int]::TryParse($selection, [ref] $number) -or
+            $number -lt 1 -or $number -gt $vaults.Count) {
+            throw 'Invalid vault selection.'
+        }
+        $VaultName = $vaults[$number - 1].name
     }
 
-    Write-Information 'Select a managed signing vault:' -InformationAction Continue
-    for ($index = 0; $index -lt $vaults.Count; $index++) {
-        Write-Information "[$($index + 1)] $($vaults[$index].name) ($($vaults[$index].resourceGroup))" -InformationAction Continue
+    $vault = Invoke-AzJson -Arguments @('keyvault', 'show', '--name', $VaultName)
+    if (-not (Test-ManagedResource -Resource $vault)) {
+        throw "Vault '$VaultName' exists without the required ownership tags."
     }
-    $selection = Read-Host 'Selection'
-    $number = 0
-    if (-not [int]::TryParse($selection, [ref] $number) -or
-        $number -lt 1 -or $number -gt $vaults.Count) {
-        throw 'Invalid vault selection.'
-    }
-    return $vaults[$number - 1]
+    return $vault
 }
 
 function Get-RepositoryProfile {
@@ -251,6 +272,66 @@ function Test-ExactConfirmation {
     )
 
     return $Actual -ceq $Expected
+}
+
+function Test-TauriUpdaterCredential {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword',
+        '',
+        Justification = 'The Tauri CLI requires the decoded updater-key password in its child-process environment.'
+    )]
+    param(
+        [Parameter(Mandatory)][byte[]] $PrivateKeyBytes,
+        [AllowEmptyString()][string] $Password,
+        [Parameter(Mandatory)][string] $TauriProjectPath
+    )
+
+    Assert-Tool -Name npm
+    $projectPath = (Resolve-Path -LiteralPath $TauriProjectPath).Path
+    if (-not (Test-Path -LiteralPath (Join-Path $projectPath 'package.json') -PathType Leaf)) {
+        throw "Tauri project path does not contain package.json: $projectPath"
+    }
+
+    $keyPath = New-ProtectedTempFile -Bytes $PrivateKeyBytes
+    $temporaryDirectory = Split-Path -Parent $keyPath
+    $payloadPath = Join-Path $temporaryDirectory 'verification-payload'
+    try {
+        [IO.File]::WriteAllText(
+            $payloadPath,
+            "apple-signing-workflows updater verification`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode(
+                $payloadPath,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite
+            )
+        }
+
+        Invoke-Tool -Name npm -Arguments @(
+            'run', 'tauri', '--',
+            'signer', 'sign',
+            $payloadPath
+        ) -WorkingDirectory $projectPath -Environment @{
+            TAURI_SIGNING_PRIVATE_KEY_PATH     = $keyPath
+            TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $Password
+        } -Sensitive | Out-Null
+        return $true
+    }
+    catch {
+        throw 'Tauri could not sign with the stored updater key and password.'
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryDirectory) {
+            Get-ChildItem -LiteralPath $temporaryDirectory -File | ForEach-Object {
+                $length = $_.Length
+                if ($length -gt 0) {
+                    [IO.File]::WriteAllBytes($_.FullName, [byte[]]::new($length))
+                }
+            }
+            Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
+        }
+    }
 }
 
 function Read-ConfirmedSecureString {
@@ -373,6 +454,7 @@ Export-ModuleMember -Function @(
     'Test-SecretValueSize',
     'Test-Pkcs12Bundle',
     'Test-ExactConfirmation',
+    'Test-TauriUpdaterCredential',
     'Read-ConfirmedSecureString',
     'ConvertFrom-ProtectedString',
     'New-ProtectedTempFile',

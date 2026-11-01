@@ -192,7 +192,16 @@ Describe 'Managed vault discovery' {
 
     It 'uses an explicit vault name without discovery' {
         Mock Invoke-AzJson -ModuleName AppleSigning.Common {
-            [pscustomobject]@{ name = 'selected' }
+            [pscustomobject]@{
+                name = 'selected'
+                properties = [pscustomobject]@{
+                    vaultUri = 'https://' + 'synthetic-vault' + '.vault.azure.net/'
+                }
+                tags = [pscustomobject]@{
+                    'managed-by' = 'apple-signing-workflows'
+                    purpose = 'apple-signing'
+                }
+            }
         }
         Mock Find-ManagedVault -ModuleName AppleSigning.Common {
             throw 'Discovery should not run.'
@@ -200,6 +209,39 @@ Describe 'Managed vault discovery' {
 
         (Resolve-ManagedVault -VaultName selected).name | Should -Be 'selected'
         Should -Invoke Invoke-AzJson -ModuleName AppleSigning.Common -Times 1 -Exactly
+    }
+
+    It 'expands a discovered list item into the full vault object' {
+        Mock Find-ManagedVault -ModuleName AppleSigning.Common {
+            @([pscustomobject]@{ name = 'selected'; resourceGroup = 'synthetic-group' })
+        }
+        Mock Invoke-AzJson -ModuleName AppleSigning.Common {
+            [pscustomobject]@{
+                name = 'selected'
+                properties = [pscustomobject]@{
+                    vaultUri = 'https://' + 'synthetic-vault' + '.vault.azure.net/'
+                }
+                tags = [pscustomobject]@{
+                    'managed-by' = 'apple-signing-workflows'
+                    purpose = 'apple-signing'
+                }
+            }
+        }
+
+        $result = Resolve-ManagedVault
+        $result.properties.vaultUri | Should -Match '^https://'
+        Should -Invoke Invoke-AzJson -ModuleName AppleSigning.Common -Times 1 -Exactly
+    }
+
+    It 'rejects an explicitly named unmanaged vault' {
+        Mock Invoke-AzJson -ModuleName AppleSigning.Common {
+            [pscustomobject]@{
+                name = 'unmanaged'
+                tags = [pscustomobject]@{ purpose = 'other' }
+            }
+        }
+
+        { Resolve-ManagedVault -VaultName unmanaged } | Should -Throw '*ownership tags*'
     }
 }
 
@@ -230,6 +272,49 @@ Describe 'Protected command execution' {
         $caught | Should -Not -BeNullOrEmpty
         $caught.Exception.Message | Should -Not -Match 'synthetic-sensitive-value'
         $caught.Exception.Message | Should -Match 'protected input'
+    }
+}
+
+Describe 'Tauri updater credential verification' {
+    It 'passes key and password only through the child-process environment' {
+        $project = Join-Path $TestDrive 'tauri-project'
+        [IO.Directory]::CreateDirectory($project) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $project 'package.json'), '{}')
+
+        Mock Assert-Tool -ModuleName AppleSigning.Common {}
+        Mock Invoke-Tool -ModuleName AppleSigning.Common {
+            $Environment.TAURI_SIGNING_PRIVATE_KEY_PASSWORD | Should -BeExactly 'synthetic-password'
+            Test-Path -LiteralPath $Environment.TAURI_SIGNING_PRIVATE_KEY_PATH | Should -BeTrue
+            $WorkingDirectory | Should -BeExactly $project
+            $Arguments | Should -Contain 'signer'
+            $Arguments | Should -Contain 'sign'
+            return 'signed'
+        }
+
+        Test-TauriUpdaterCredential `
+            -PrivateKeyBytes ([Text.Encoding]::UTF8.GetBytes('synthetic-key')) `
+            -Password 'synthetic-password' `
+            -TauriProjectPath $project | Should -BeTrue
+
+        Should -Invoke Invoke-Tool -ModuleName AppleSigning.Common -Times 1 -Exactly
+    }
+
+    It 'fails when Tauri rejects the updater credential' {
+        $project = Join-Path $TestDrive 'failing-tauri-project'
+        [IO.Directory]::CreateDirectory($project) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $project 'package.json'), '{}')
+
+        Mock Assert-Tool -ModuleName AppleSigning.Common {}
+        Mock Invoke-Tool -ModuleName AppleSigning.Common {
+            throw 'synthetic rejection'
+        }
+
+        {
+            Test-TauriUpdaterCredential `
+                -PrivateKeyBytes ([Text.Encoding]::UTF8.GetBytes('synthetic-key')) `
+                -Password 'wrong-password' `
+                -TauriProjectPath $project
+        } | Should -Throw '*could not sign*'
     }
 }
 
