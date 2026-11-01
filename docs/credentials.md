@@ -18,7 +18,7 @@ privacy matters.
 
 ```powershell
 ./scripts/manage-vault.ps1 -Action Hydrate -Repository owner/application
-./scripts/manage-vault.ps1 -Action Verify -Repository owner/application
+./scripts/manage-vault.ps1 -Action Verify -Repository owner/application -TauriProjectPath ../application
 ```
 
 Passwords use hidden, confirmed prompts. Certificates and updater keys are read from
@@ -26,6 +26,10 @@ prompted file paths. Values never appear in command arguments.
 
 The certificate and updater key are encoded exactly once. The workflow decodes the
 updater key to an owner-readable temporary file because Tauri accepts a key path.
+
+`Verify` uses the caller project's installed, pinned Tauri CLI to sign a disposable
+payload. This proves that the stored updater key and password work together. Run
+`npm ci` in the caller project first if its dependencies are not installed.
 
 ## Rotation
 

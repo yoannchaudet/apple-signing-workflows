@@ -29,7 +29,7 @@ gh auth login
 ./scripts/provision-azure.ps1
 ./scripts/register-caller.ps1 -Repository owner/application
 ./scripts/manage-vault.ps1 -Action Hydrate -Repository owner/application
-./scripts/manage-vault.ps1 -Action Verify -Repository owner/application
+./scripts/manage-vault.ps1 -Action Verify -Repository owner/application -TauriProjectPath ../application
 ```
 
 These commands discover the active Azure subscription at runtime. They do not persist

@@ -16,6 +16,7 @@ param(
 
     [string] $Repository,
     [string] $VaultName,
+    [string] $TauriProjectPath,
 
     [ValidateSet(
         'apple-certificate',
@@ -307,6 +308,17 @@ try {
                 if ($updaterBytes.Length -eq 0) {
                     throw "Secret '$($names.UpdaterKey)' decodes to an empty updater key."
                 }
+                if (-not $TauriProjectPath) {
+                    throw '-TauriProjectPath is required for Verify so the stored updater key and password can be tested with the project Tauri CLI.'
+                }
+                $updaterPassword = Get-SecretVersionValue -Vault $vault.name -Name $names.UpdaterPassword
+                if ($updaterPassword -ceq $emptyPasswordMarker) {
+                    $updaterPassword = ''
+                }
+                Test-TauriUpdaterCredential `
+                    -PrivateKeyBytes $updaterBytes `
+                    -Password $updaterPassword `
+                    -TauriProjectPath $TauriProjectPath | Out-Null
             }
         }
         'Rotate' {

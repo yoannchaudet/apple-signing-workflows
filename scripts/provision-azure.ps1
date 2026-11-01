@@ -25,6 +25,36 @@ try {
     $account = Get-ActiveAzureAccount
     Write-Information "Active Azure account: $($account.name)" -InformationAction Continue
 
+    $keyVaultProvider = Invoke-AzJson -Arguments @(
+        'provider', 'show',
+        '--namespace', 'Microsoft.KeyVault'
+    )
+    if ($keyVaultProvider.registrationState -ne 'Registered') {
+        if (-not $PSCmdlet.ShouldProcess(
+                'Microsoft.KeyVault',
+                'Register Azure resource provider and wait for completion'
+            )) {
+            Write-Information 'Microsoft.KeyVault registration is required; no resources were changed.' -InformationAction Continue
+            exit 0
+        }
+
+        Write-Information 'Registering the Microsoft.KeyVault resource provider...' -InformationAction Continue
+        Invoke-Tool -Name az -Arguments @(
+            'provider', 'register',
+            '--namespace', 'Microsoft.KeyVault',
+            '--wait',
+            '--output', 'none'
+        ) -AllowEmpty | Out-Null
+
+        $keyVaultProvider = Invoke-AzJson -Arguments @(
+            'provider', 'show',
+            '--namespace', 'Microsoft.KeyVault'
+        )
+        if ($keyVaultProvider.registrationState -ne 'Registered') {
+            throw "Microsoft.KeyVault registration did not complete; current state is '$($keyVaultProvider.registrationState)'."
+        }
+    }
+
     $managedVaults = @(Find-ManagedVault)
     if (-not $VaultName -and $managedVaults.Count -eq 1) {
         $VaultName = $managedVaults[0].name
