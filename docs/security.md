@@ -24,6 +24,20 @@ Use disposable resources and a sample Tauri application to prove:
   architectures, updater signature, and draft release assets are valid.
 - Cleanup runs after both successful and deliberately failed builds.
 
+For a native caller, use a sample XcodeGen app with an embedded framework. Verify both
+architectures, tag and bundle-version agreement, every nested signature, hardened
+runtime, the Developer ID team, an `Accepted` notarization result, the stapled ticket,
+Gatekeeper assessment, and the final ZIP. Confirm that rejected notarization and cleanup
+failures cannot create or publish a release. The native workflow deliberately rejects
+custom entitlements, App Sandbox, and nested apps, extensions, or XPC services.
+
+The native build job has no signing environment or OIDC permission. The signing job
+receives a tar archive, safely extracts its data, and does not execute the app or caller
+scripts. This reduces exposure but does not make untrusted release code safe. Review
+the application, dependencies, and workflow before approving the signing environment.
+Local synthetic credential tests prove import and stdin handling without sending Apple
+requests; they do not replace this production gate.
+
 Audit the complete repository history before changing this repository from private to
 public. Public visibility is required for public callers.
 
