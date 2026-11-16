@@ -42,12 +42,79 @@ class NativeSigningTests(unittest.TestCase):
 
     def test_command_failure_withholds_protected_output_and_arguments(self):
         value = secrets.token_hex(24)
-        result = subprocess.CompletedProcess(["tool"], 4, value, value)
+        for command in ("az", "/usr/bin/security", "/usr/bin/openssl", "/usr/bin/xcrun"):
+            result = subprocess.CompletedProcess([command], 4, value, value + " errSecInternalComponent")
+            with self.subTest(command=command), patch.object(self.module.subprocess, "run", return_value=result):
+                with self.assertRaises(RuntimeError) as error:
+                    self.module.run([command, value])
+            self.assertNotIn(value, str(error.exception))
+            self.assertNotIn("errSecInternalComponent", str(error.exception))
+            self.assertIn("exit 4", str(error.exception))
+
+    def test_protected_timeout_withholds_arguments_and_captured_output(self):
+        value = secrets.token_hex(24)
+        timeout = subprocess.TimeoutExpired(["az", value], 120, output=value, stderr=value)
+        with patch.object(self.module.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(RuntimeError) as error:
+                self.module.run(["az", value])
+        self.assertNotIn(value, str(error.exception))
+        self.assertTrue(error.exception.__suppress_context__)
+
+    def test_codesign_failure_reports_only_fixed_phrases_and_relative_target(self):
+        value = secrets.token_hex(24)
+        app = Path("/private/hidden/Fixture.app")
+        path = app / "Contents/Frameworks/Core.framework/Versions/A/Core"
+        result = subprocess.CompletedProcess([], 1, "unrelated output " + value, (
+            f'{path}: errSecInternalComponent\n'
+            f'Warning: unable to build chain to self-signed root for signer "{value}"\n'
+            f'private data: {value}\n::error::untrusted workflow command'
+        ))
         with patch.object(self.module.subprocess, "run", return_value=result):
             with self.assertRaises(RuntimeError) as error:
-                self.module.run(["tool", value])
-        self.assertNotIn(value, str(error.exception))
-        self.assertIn("exit 4", str(error.exception))
+                self.module.codesign(["--force", "--sign", value], operation="sign", path=path, app=app)
+        message = str(error.exception)
+        self.assertIn("codesign sign failed", message)
+        self.assertIn(path.relative_to(app).as_posix(), message)
+        self.assertIn("errSecInternalComponent", message)
+        self.assertIn("unable to build chain to self-signed root", message)
+        self.assertIn("exit 1", message)
+        for withheld in (value, str(app), "private data", "::error::", "unrelated output", "for signer"):
+            self.assertNotIn(withheld, message)
+
+    def test_codesign_unknown_output_and_timeout_remain_protected(self):
+        value = secrets.token_hex(24)
+        app = Path("/private/hidden/Fixture.app")
+        failures = (
+            subprocess.CompletedProcess([], 1, value, value),
+            subprocess.TimeoutExpired(["codesign", value], 120, output=value, stderr=value),
+        )
+        for failure in failures:
+            options = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+            with self.subTest(failure=type(failure).__name__), patch.object(self.module.subprocess, "run", **options):
+                with self.assertRaises(RuntimeError) as error:
+                    self.module.codesign(["--sign", value], operation="sign", path=app, app=app)
+            self.assertIn('bundle target "."', str(error.exception))
+            self.assertIn("protected output withheld", str(error.exception))
+            self.assertNotIn(value, str(error.exception))
+            self.assertNotIn(str(app), str(error.exception))
+
+    def test_codesign_diagnostics_are_bounded_and_target_controls_are_escaped(self):
+        app = Path("/private/hidden/Fixture.app")
+        path = app / ("nested\n::warning::" + chr(27) + chr(0x1F600) * 200)
+        output = "\n".join((
+            "errSecInternalComponent", "CSSMERR_TP_NOT_TRUSTED", "User interaction is not allowed",
+            "unable to build chain to self-signed root", "no identity found",
+        )) * 1000
+        result = subprocess.CompletedProcess([], 1, output, output)
+        with patch.object(self.module.subprocess, "run", return_value=result):
+            with self.assertRaises(RuntimeError) as error:
+                self.module.codesign(["--verify"], operation="verify signed bundle", path=path, app=app)
+        message = str(error.exception)
+        self.assertLess(len(message), 2048)
+        self.assertNotIn("\n", message)
+        self.assertNotIn(chr(27), message)
+        self.assertNotIn("no identity found", message)
+        self.assertIn("...", message)
 
     def test_passwords_reach_stdin_or_environment_but_never_process_arguments(self):
         password = secrets.token_hex(24) + " ' \" $ \\"
@@ -104,8 +171,13 @@ class NativeSigningTests(unittest.TestCase):
             return json.dumps({"status": "Accepted"}) if "submit" in arguments else ""
 
         with patch.dict(os.environ, APPLE_ID="synthetic@example.invalid", APPLE_TEAM_ID="SYNTHETIC0"):
-            with patch.object(self.module, "run", side_effect=run):
-                self.module.notarize(Path("/tmp/App.app"), Path("/tmp"), Path("/tmp/signing"), secrets.token_hex(24))
+            with patch.object(self.module, "run", side_effect=run), patch.object(self.module, "codesign") as signing:
+                self.module.notarize(Path("/tmp/App.app"), Path("/tmp"), Path("/tmp/signing"),
+                                     secrets.token_hex(24))
+        self.assertEqual(signing.call_args.args[0], ["--verify", "--deep", "--strict"])
+        self.assertEqual(signing.call_args.kwargs, {
+            "operation": "verify stapled bundle", "path": Path("/tmp/App.app"), "app": Path("/tmp/App.app"),
+        })
         self.assertEqual([command[2] for command in calls if command[1:2] == ["stapler"]],
                          ["staple", "validate"])
         self.assertIn("--assess", calls[-1])
@@ -255,10 +327,23 @@ class NativeSigningTests(unittest.TestCase):
                                 with patch.object(self.module, "code_objects", return_value=[app]):
                                     with patch.object(self.module, "notarize"):
                                         with patch.object(self.module, "run", return_value=(
-                                                '"Developer ID Application: Fixture (SYNTHETIC0)"')) as mocked:
-                                            self.module.main()
-                    requirement = next(call.args[0] for call in mocked.call_args_list if "-R" in call.args[0])
-                    self.module.run(["/usr/bin/csreq", "-r", requirement[-2], "-t"])
+                                                '"Developer ID Application: Fixture (SYNTHETIC0)"')):
+                                            with patch.object(self.module, "codesign") as signing:
+                                                self.module.main()
+                    self.assertEqual(signing.call_count, 3)
+                    sign, verify, developer_id = signing.call_args_list
+                    self.assertEqual(sign.args[0], [
+                        "--force", "--sign", environment["APPLE_SIGNING_IDENTITY"], "--keychain", str(keychain),
+                        "--options", "runtime", "--timestamp",
+                    ])
+                    self.assertEqual(sign.kwargs, {"operation": "sign", "path": app, "app": app})
+                    self.assertEqual(verify.args[0], ["--verify", "--deep", "--strict"])
+                    self.assertEqual(verify.kwargs, {"operation": "verify signed bundle", "path": app, "app": app})
+                    self.assertEqual(developer_id.args[0][:3], ["--verify", "--strict", "-R"])
+                    self.assertEqual(developer_id.kwargs, {"operation": "verify Developer ID", "path": app,
+                                                         "app": app})
+                    requirement = next(call.args[0] for call in signing.call_args_list if "-R" in call.args[0])
+                    self.module.run(["/usr/bin/csreq", "-r", requirement[-1], "-t"])
                 for arguments in calls:
                     self.assertNotIn(password, " ".join(arguments))
             finally:
@@ -271,6 +356,21 @@ class NativeSigningTests(unittest.TestCase):
                         ["/usr/bin/security", "list-keychains", "-d", "user", "-s",
                          *json.loads(snapshot.read_text())], capture_output=True, check=True,
                     )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Requires macOS codesign")
+    def test_real_codesign_failure_is_labeled_without_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Fixture.app"
+            target = app / "Contents/MacOS/unsigned"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(os.urandom(24))
+            with self.assertRaises(RuntimeError) as error:
+                self.module.codesign(["--verify", "--strict"],
+                                     operation="verify signed bundle", path=target, app=app)
+        self.assertIn("Contents/MacOS/unsigned", str(error.exception))
+        self.assertIn("exit 1", str(error.exception))
+        self.assertIn("code object is not signed at all", str(error.exception))
+        self.assertNotIn(directory, str(error.exception))
 
 
 if __name__ == "__main__":
