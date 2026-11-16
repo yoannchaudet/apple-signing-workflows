@@ -27,9 +27,17 @@ Use disposable resources and a sample Tauri application to prove:
 For a native caller, use a sample XcodeGen app with an embedded framework. Verify both
 architectures, tag and bundle-version agreement, every nested signature, hardened
 runtime, the Developer ID team, an `Accepted` notarization result, the stapled ticket,
-Gatekeeper assessment, and the final ZIP. Confirm that rejected notarization and cleanup
-failures cannot create or publish a release. The native workflow deliberately rejects
-custom entitlements, App Sandbox, and nested apps, extensions, or XPC services.
+Gatekeeper assessment, and the final ZIP. Mount the final DMG read-only and verify
+that it contains the same stapled app and a usable `/Applications` symlink, with
+readable files, executable modes, and framework symlinks intact. Verify the DMG's
+Developer ID team, timestamp, separate `Accepted` notarization result, stapled ticket,
+container integrity, and Gatekeeper assessment. This separate outer-image submission
+is a native offline-distribution safeguard; it does not describe Tauri's flow.
+Confirm that the two uploaded assets match their final local SHA-256 digests and sizes.
+Confirm that rejected app or DMG notarization and cleanup failures cannot create or
+publish a release, and that partial uploads cannot publish a draft. The native workflow
+deliberately rejects custom entitlements, App Sandbox, and nested apps, extensions,
+or XPC services.
 
 The native build job has no signing environment or OIDC permission. The signing job
 receives a tar archive, safely extracts its data, and does not execute the app or caller
@@ -41,7 +49,8 @@ requests; they do not replace this production gate.
 ## Native signing diagnostics and recovery
 
 Native signing errors identify the operation and an escaped, length-limited path relative
-to the application bundle. Only fixed, recognized `codesign` diagnostic phrases appear;
+to the application bundle or, for the DMG, the release asset directory. Only fixed,
+recognized `codesign` diagnostic phrases appear;
 raw output, signer metadata, absolute paths, and unknown diagnostics remain withheld.
 Other subprocess failures retain blanket output protection. A diagnostic identifies what
 the tool reported, not an independently established root cause.

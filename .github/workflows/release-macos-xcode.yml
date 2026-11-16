@@ -29,7 +29,7 @@ on:
         description: Text prepended to generated release notes
         required: false
         type: string
-        default: Download and extract the macOS ZIP below to install.
+        default: Download the macOS DMG and drag the app to Applications. Use the ZIP for a standalone app. Install future versions manually.
       release-draft:
         description: Leave the GitHub Release as a draft
         required: false
@@ -129,7 +129,7 @@ jobs:
     name: Sign, notarize, and publish
     needs: build
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
     environment: release
     permissions:
       contents: write
@@ -181,6 +181,7 @@ jobs:
           allow-no-subscriptions: true
 
       - name: Sign and notarize native app
+        timeout-minutes: 50
         env:
           VAULT_URI: ${{ vars.AZURE_KEY_VAULT_URI }}
           APPLE_ID: ${{ vars.APPLE_ID }}
@@ -196,6 +197,7 @@ jobs:
           import re
           import secrets
           import shlex
+          import stat
           import subprocess
 
           def run(arguments, *, input=None, env=None, timeout=120):
@@ -210,14 +212,14 @@ jobs:
                                      f"(exit {result.returncode}); protected output withheld.")
               return result.stdout
 
-          def codesign(options, *, operation, path, app):
-              relative = path.relative_to(app).as_posix()
+          def codesign(options, *, operation, path, root):
+              relative = path.relative_to(root).as_posix()
               target = json.dumps(relative[:120] + ("..." if len(relative) > 120 else ""))
               try:
                   result = subprocess.run(["/usr/bin/codesign", *options, str(path)], text=True,
                                           errors="replace", capture_output=True, timeout=120)
               except subprocess.TimeoutExpired:
-                  raise RuntimeError(f"codesign {operation} timed out for bundle target {target}; "
+                  raise RuntimeError(f"codesign {operation} timed out for target {target}; "
                                      "protected output withheld.") from None
               if result.returncode:
                   output = (result.stdout[:8192] + "\n" + result.stderr[:8192]).casefold()
@@ -244,7 +246,7 @@ jobs:
                   ) if phrase.casefold() in output][:4]
                   detail = ("codesign reported: " + "; ".join(diagnostics) if diagnostics else
                             "unrecognized diagnostic; protected output withheld.")
-                  raise RuntimeError(f"codesign {operation} failed for bundle target {target} "
+                  raise RuntimeError(f"codesign {operation} failed for target {target} "
                                      f"(exit {result.returncode}); {detail}")
               return result.stdout
 
@@ -327,16 +329,53 @@ jobs:
                    "--keychain", str(keychain)], input=password + "\n")
               submission = root / "submission.zip"
               run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(submission)])
+              submit_and_staple(app, submission, keychain)
+              codesign(["--verify", "--deep", "--strict"],
+                       operation="verify stapled bundle", path=app, root=app)
+              run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(app)])
+
+          def submit_and_staple(target, submission, keychain):
               result = json.loads(run(["/usr/bin/xcrun", "notarytool", "submit", str(submission),
                                        "--keychain-profile", "native-release", "--keychain", str(keychain),
                                        "--wait", "--timeout", "15m", "--output-format", "json"], timeout=960))
               if result.get("status") != "Accepted":
                   raise RuntimeError("Apple did not accept the notarization submission.")
-              run(["/usr/bin/xcrun", "stapler", "staple", str(app)])
-              run(["/usr/bin/xcrun", "stapler", "validate", str(app)])
+              run(["/usr/bin/xcrun", "stapler", "staple", str(target)])
+              run(["/usr/bin/xcrun", "stapler", "validate", str(target)])
+
+          def distribution_modes(app):
+              # Signing and stapling can create files under the private signing umask.
+              for path in [app, *app.rglob("*")]:
+                  mode = path.lstat().st_mode
+                  if stat.S_ISLNK(mode):
+                      continue
+                  if stat.S_ISDIR(mode):
+                      path.chmod(0o755)
+                  elif stat.S_ISREG(mode):
+                      path.chmod(0o755 if mode & 0o111 else 0o644)
+                  else:
+                      raise RuntimeError("The application contains an unsupported filesystem entry.")
+
+          def create_disk_image(app, root, asset):
+              staging = root / "disk-image"
+              staging.mkdir()
+              staging.chmod(0o755)
+              staged_app = staging / app.name
+              run(["/usr/bin/ditto", str(app), str(staged_app)])
+              distribution_modes(staged_app)
+              (staging / "Applications").symlink_to("/Applications", target_is_directory=True)
               codesign(["--verify", "--deep", "--strict"],
-                       operation="verify stapled bundle", path=app, app=app)
-              run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(app)])
+                       operation="verify staged bundle", path=staged_app, root=staged_app)
+              run(["/usr/bin/xcrun", "stapler", "validate", str(staged_app)])
+              run(["/usr/bin/hdiutil", "create", "-volname", app.stem, "-srcfolder", str(staging),
+                   "-fs", "HFS+", "-format", "UDZO", str(asset)], timeout=600)
+
+          def verify_developer_id(path, root, team):
+              codesign(["--verify", "--strict", "-R",
+                   '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
+                   f'and certificate leaf[subject.OU] = "{team}"'],
+                   operation="verify Developer ID", path=path, root=root)
 
           def main():
               os.umask(0o077)
@@ -370,19 +409,32 @@ jobs:
                   raise RuntimeError("The vault certificate does not contain the configured valid signing identity.")
               for path in objects:
                   codesign(["--force", "--sign", identity, "--keychain", str(keychain),
-                            "--options", "runtime", "--timestamp"], operation="sign", path=path, app=app)
+                            "--options", "runtime", "--timestamp"], operation="sign", path=path, root=app)
               codesign(["--verify", "--deep", "--strict"],
-                       operation="verify signed bundle", path=app, app=app)
-              codesign(["--verify", "--strict", "-R",
-                   '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
-                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
-                   f'and certificate leaf[subject.OU] = "{team}"'],
-                   operation="verify Developer ID", path=app, app=app)
+                       operation="verify signed bundle", path=app, root=app)
+              verify_developer_id(app, app, team)
               notarize(app, root, keychain, fetch_secret(vault, "apple-notarization-password"))
+              distribution_modes(app)
+              codesign(["--verify", "--deep", "--strict"],
+                       operation="verify distributable bundle", path=app, root=app)
+              run(["/usr/bin/xcrun", "stapler", "validate", str(app)])
               output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release"
               output.mkdir(mode=0o700)
-              asset = output / f'{os.environ["APP_NAME"]}-{os.environ["GITHUB_REF_NAME"]}-universal-macos.zip'
+              asset_name = os.environ["APP_NAME"].replace(" ", ".")
+              basename = f'{asset_name}-{os.environ["GITHUB_REF_NAME"]}-universal-macos'
+              asset = output / (basename + ".zip")
               run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(asset)])
+              image = output / (basename + ".dmg")
+              create_disk_image(app, root, image)
+              codesign(["--force", "--sign", identity, "--keychain", str(keychain), "--timestamp"],
+                       operation="sign disk image", path=image, root=output)
+              verify_developer_id(image, output, team)
+              submit_and_staple(image, image, keychain)
+              codesign(["--verify", "--strict"], operation="verify stapled disk image", path=image, root=output)
+              verify_developer_id(image, output, team)
+              run(["/usr/bin/hdiutil", "verify", str(image)], timeout=600)
+              run(["/usr/sbin/spctl", "--assess", "--type", "open",
+                   "--context", "context:primary-signature", str(image)])
 
           if __name__ == "__main__":
               main()
@@ -436,6 +488,7 @@ jobs:
           RELEASE_DRAFT: ${{ inputs.release-draft }}
         shell: python3 {0}
         run: |
+          import hashlib
           import json
           import os
           import pathlib
@@ -446,10 +499,20 @@ jobs:
 
           tag = os.environ["GITHUB_REF_NAME"]
           repository = os.environ["GITHUB_REPOSITORY"]
-          asset = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release" / (
-              f'{os.environ["APP_NAME"]}-{tag}-universal-macos.zip')
-          if not asset.is_file():
-              raise RuntimeError("The signed release asset is missing.")
+          output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release"
+          asset_name = os.environ["APP_NAME"].replace(" ", ".")
+          basename = f'{asset_name}-{tag}-universal-macos'
+          assets = [output / (basename + suffix) for suffix in (".zip", ".dmg")]
+          if (not output.is_dir() or set(output.iterdir()) != set(assets)
+                  or any(asset.is_symlink() or not asset.is_file() or asset.stat().st_size == 0
+                         for asset in assets)):
+              raise RuntimeError("The signed release assets must be exactly the nonempty ZIP and DMG.")
+          # Hash only final signed/stapled bytes; GitHub exposes these digests on release assets.
+          expected = {}
+          for asset in assets:
+              with asset.open("rb") as stream:
+                  digest = hashlib.file_digest(stream, "sha256").hexdigest()
+              expected[asset.name] = (asset.stat().st_size, "sha256:" + digest)
           pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repository}/releases"]))
           matches = [release for page in pages for release in page if release["tag_name"] == tag]
           if len(matches) > 1:
@@ -461,6 +524,40 @@ jobs:
               notes.write_text(os.environ["RELEASE_BODY"])
               gh(["release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
                   "--title", os.environ["RELEASE_NAME"], "--notes-file", str(notes), "--generate-notes"])
-          gh(["release", "upload", tag, str(asset), "--repo", repository, "--clobber"])
+          release = json.loads(gh(["release", "view", tag, "--repo", repository, "--json", "isDraft,databaseId"]))
+          if not release["isDraft"]:
+              raise RuntimeError("The release is no longer a draft; refusing further changes.")
+          gh(["release", "upload", tag, *map(str, assets), "--repo", repository, "--clobber"])
+          release = json.loads(gh(["release", "view", tag, "--repo", repository, "--json", "isDraft,databaseId"]))
+          if not release["isDraft"]:
+              raise RuntimeError("The release is no longer a draft; refusing further changes.")
+          pages = json.loads(gh(["api", "--paginate", "--slurp",
+                                f'repos/{repository}/releases/{release["databaseId"]}/assets']))
+          uploaded = [asset for page in pages for asset in page if asset["name"] in expected]
+          if len(uploaded) != len(expected) or {asset["name"] for asset in uploaded} != set(expected):
+              raise RuntimeError("The release does not contain both uploaded native assets.")
+          for asset in uploaded:
+              if asset.get("digest") is None:
+                  raise RuntimeError("GitHub has not provided a SHA-256 digest for an uploaded native asset; "
+                                     "leaving the release draft for review or retry.")
+              if asset["state"] != "uploaded" or (asset["size"], asset["digest"]) != expected[asset["name"]]:
+                  raise RuntimeError("An uploaded native asset does not match the final local artifact.")
           if os.environ["RELEASE_DRAFT"] == "false":
               gh(["release", "edit", tag, "--repo", repository, "--draft=false"])
+
+      - name: Remove temporary native release files
+        if: always()
+        shell: python3 {0}
+        run: |
+          import os
+          import pathlib
+          import shutil
+
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          for name in ("native-release", "native-input"):
+              path = temporary / name
+              if path.is_symlink():
+                  path.unlink()
+              elif path.exists():
+                  shutil.rmtree(path)
+          (temporary / "native-release-notes.txt").unlink(missing_ok=True)

@@ -65,7 +65,8 @@ secrets.
 Use `release-macos-xcode.yml` for a native XcodeGen project with a shared application
 scheme. The workflow builds an unsigned universal Release app in a read-only job.
 A separate job enters the caller's protected `release` environment, signs the app and
-embedded frameworks, notarizes it, staples the accepted ticket, and packages the app.
+embedded frameworks, notarizes it, staples the accepted ticket, and packages the app
+as a ZIP and a drag-to-Applications disk image (DMG).
 The signing job does not check out or run caller build scripts.
 
 The caller supplies a stable `vMAJOR.MINOR.PATCH` tag, with `contents: write` and
@@ -107,7 +108,7 @@ The native workflow accepts these inputs:
 | `app-name` | Yes | None | Built product name, without `.app` |
 | `working-directory` | No | `.` | Directory containing `project.yml` |
 | `release-name` | No | Repository name and tag | Release title |
-| `release-body` | No | ZIP installation text | Text before generated release notes |
+| `release-body` | No | DMG installation and manual-update text | Text before generated release notes |
 | `release-draft` | No | `true` | Keep the release as a draft |
 
 It uses the same six `release` environment variables as the Tauri workflow. It reads
@@ -116,12 +117,41 @@ only `apple-developer-id-certificate`, `apple-developer-id-password`, and
 secret, subscription variable, or caller-provided GitHub secret. The built-in
 `GITHUB_TOKEN` creates the release.
 
-The release asset is `APP_NAME-vMAJOR.MINOR.PATCH-universal-macos.zip`. It contains the
-stapled `.app` and preserves executable permissions and framework symlinks. The
-intermediate `unsigned-macos-app` Actions artifact contains `unsigned-app.tar` and has
-one-day retention; it is not an installable release asset. Re-runs replace the asset
-on an existing draft but fail rather than modify an already published release.
-Set `release-draft: false` only when automatic publication is intended.
+The workflow creates two release assets:
+
+| Asset | Contents |
+|---|---|
+| `APP_NAME-vMAJOR.MINOR.PATCH-universal-macos.dmg` | Stapled `.app` and an `Applications` symlink for drag-to-install |
+| `APP_NAME-vMAJOR.MINOR.PATCH-universal-macos.zip` | Standalone stapled `.app`, preserving the existing ZIP filename |
+
+In asset filenames only, spaces in `APP_NAME` become dots to avoid GitHub's upload
+filename rewriting. Application bundle and volume names keep their spaces.
+
+Both formats preserve executable permissions and framework symlinks and use
+distributable directory and file permissions. The headless DMG uses macOS `hdiutil`
+without Finder automation, custom artwork, or a packaging dependency. After app
+notarization, the workflow signs the DMG with Developer ID and a timestamp, submits
+it separately for notarization, staples and validates its ticket, and verifies its
+signature, team, integrity, and Gatekeeper assessment. This second submission is an
+additional native distribution safeguard, not a requirement for parity with Tauri.
+The release job allows 60 minutes, including two bounded 15-minute notarization waits.
+
+The workflow prepares and verifies both assets before creating or updating a release.
+It computes SHA-256 digests of the final files and checks GitHub's uploaded asset
+digests and sizes before publication. It does not create a checksum-text asset.
+If GitHub does not provide an asset digest, verification fails and leaves the draft
+for review or retry.
+Re-runs replace only these two known asset names on an existing draft, preserve
+unrelated assets and release notes, and fail rather than modify an already published
+release or choose between duplicate releases. Set `release-draft: false` only when
+automatic publication is intended; the workflow publishes only after both uploads
+pass verification. Upload failures leave the release as a draft.
+
+The intermediate `unsigned-macos-app` Actions artifact contains `unsigned-app.tar`
+and has one-day retention; it is not an installable release asset. Native apps have
+no automatic updater under this contract. Users install new versions manually. The
+workflow does not produce Tauri updater tarballs, `.sig` files, or `latest.json`.
+The Tauri workflow and its updater behavior remain unchanged.
 
 The supported signing contract excludes custom entitlements, App Sandbox, nested
 applications, app extensions, and XPC services. Such projects need a reviewed signing

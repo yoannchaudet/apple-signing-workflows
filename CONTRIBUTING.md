@@ -16,6 +16,10 @@ the same checks.
 The native workflow tests use Python's standard library. On macOS, they also generate
 a disposable certificate and keychain and test the notarization credential prompt with
 validation disabled. They do not contact Apple or use real signing credentials.
+They also create a disposable headless DMG, mount it read-only, compare its app
+contents, permissions, and symlinks with the standalone ZIP, and detach the owned
+mount. Mock tests check notarization ordering, protected diagnostics, and draft-only
+publication of the complete native artifact set.
 
 Never use real Azure identifiers or signing values in examples or tests. Use descriptive
 placeholders instead.
