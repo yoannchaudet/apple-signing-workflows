@@ -58,6 +58,11 @@ and notarization profile. Cleanup deletes these files and the keychain, restores
 original keychain search list, and clears the Azure session, including after failure.
 No signing credential is passed through step outputs or release artifacts.
 
+The temporary keychain is added to the existing user search list during signing.
+`codesign --keychain` selects the signing identity, but certificate-chain construction
+still uses the search list. Adding the keychain makes imported intermediate certificates
+available without replacing the runner's existing keychains.
+
 `Verify` uses the caller project's installed, pinned Tauri CLI to sign a disposable
 payload. This proves that the stored updater key and password work together. Run
 `npm ci` in the caller project first if its dependencies are not installed.

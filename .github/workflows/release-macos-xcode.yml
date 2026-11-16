@@ -271,8 +271,8 @@ jobs:
               import_password = secrets.token_hex(32)
               mask(keychain_password)
               mask(import_password)
-              (root / "keychains.json").write_text(json.dumps(shlex.split(
-                  run(["/usr/bin/security", "list-keychains", "-d", "user"]))))
+              keychains = shlex.split(run(["/usr/bin/security", "list-keychains", "-d", "user"]))
+              (root / "keychains.json").write_text(json.dumps(keychains))
               original = root / "certificate.p12"
               original.write_bytes(base64.b64decode(certificate, validate=True))
               pem = root / "certificate.pem"
@@ -289,6 +289,8 @@ jobs:
                         "-T", "/usr/bin/codesign"])
               security(["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
                         "-s", "-k", keychain_password, str(keychain)])
+              # --keychain selects the identity, not the certificate-chain search list.
+              run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", str(keychain), *keychains])
               for path in (original, pem, repacked):
                   path.unlink()
               return keychain

@@ -302,6 +302,15 @@ class NativeSigningTests(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()):
                         self.module.import_identity(root, base64.b64encode(
                             (root / "fixture.p12").read_bytes()).decode(), password)
+                    search_list = shlex.split(self.module.run(
+                        ["/usr/bin/security", "list-keychains", "-d", "user"]))
+                    actual_keychains = [Path(path).resolve() for path in search_list]
+                    self.assertTrue(keychain.resolve() in actual_keychains,
+                                    "codesign must be able to find the imported certificate chain")
+                    original_keychains = json.loads((root / "keychains.json").read_text())
+                    expected_keychains = [keychain.resolve(), *[Path(path).resolve() for path in original_keychains]]
+                    self.assertTrue(actual_keychains == expected_keychains,
+                                    "The original keychain search list must be preserved")
                     identities = self.module.run(
                         ["/usr/bin/security", "find-identity", "-p", "codesigning", str(keychain)])
                     self.assertIn("Native Signing Fixture", identities)
