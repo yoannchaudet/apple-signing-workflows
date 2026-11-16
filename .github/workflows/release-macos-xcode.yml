@@ -1,0 +1,419 @@
+name: Release signed native macOS app
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Generated .xcodeproj filename relative to working-directory
+        required: true
+        type: string
+      scheme:
+        description: Shared Xcode application scheme
+        required: true
+        type: string
+      app-name:
+        description: Application product name without the .app suffix
+        required: true
+        type: string
+      working-directory:
+        description: Directory containing the XcodeGen project.yml
+        required: false
+        type: string
+        default: .
+      release-name:
+        description: GitHub Release display name
+        required: false
+        type: string
+        default: ""
+      release-body:
+        description: Text prepended to generated release notes
+        required: false
+        type: string
+        default: Download and extract the macOS ZIP below to install.
+      release-draft:
+        description: Leave the GitHub Release as a draft
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned universal app
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PROJECT: ${{ inputs.project }}
+      SCHEME: ${{ inputs.scheme }}
+      APP_NAME: ${{ inputs.app-name }}
+      WORKING_DIRECTORY: ${{ inputs.working-directory }}
+    steps:
+      - name: Validate release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Native releases require a stable vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+          if [[ ! "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*\.xcodeproj$ ||
+                ! "$SCHEME" =~ ^[A-Za-z0-9][A-Za-z0-9_.\ -]*$ ||
+                ! "$APP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.\ -]*$ ]]; then
+            echo "::error::Invalid project, scheme, or application product name."
+            exit 1
+          fi
+
+      - name: Check out caller repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install verified XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/native-xcodegen"
+          mkdir -p "$tools"
+          curl --fail --silent --show-error --location \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip \
+            --output "$tools/xcodegen.zip"
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $tools/xcodegen.zip" |
+            shasum -a 256 --check
+          unzip -q "$tools/xcodegen.zip" -d "$tools"
+          echo "$tools/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Generate and build Release app
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -showBuildSettings -json > "$RUNNER_TEMP/native-build-settings.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          settings = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-build-settings.json").read_text())
+          for target in settings:
+              values = target["buildSettings"]
+              if (values.get("CODE_SIGN_ENTITLEMENTS") or values.get("ENABLE_APP_SANDBOX") == "YES"
+                      or "--entitlements" in str(values.get("OTHER_CODE_SIGN_FLAGS", ""))):
+                  raise RuntimeError("Custom entitlements and App Sandbox require a separate signing contract.")
+          PY
+          xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/native-build" \
+            'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            INFOPLIST_KEY_CFBundleShortVersionString="${GITHUB_REF_NAME#v}" \
+            INFOPLIST_KEY_CFBundleVersion="$GITHUB_RUN_NUMBER" build
+          products="$RUNNER_TEMP/native-build/Build/Products/Release"
+          test -d "$products/$APP_NAME.app"
+          COPYFILE_DISABLE=1 tar -cf "$RUNNER_TEMP/unsigned-app.tar" -C "$products" "$APP_NAME.app"
+
+      - name: Transfer unsigned bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-macos-app
+          path: ${{ runner.temp }}/unsigned-app.tar
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  release:
+    name: Sign, notarize, and publish
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      AZURE_CORE_OUTPUT: none
+      APP_NAME: ${{ inputs.app-name }}
+    steps:
+      - name: Set temporary signing path
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'SIGNING_TEMP=%s/native-signing-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Download unsigned bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-macos-app
+          path: ${{ runner.temp }}/native-input
+
+      - name: Extract unsigned bundle
+        shell: python3 {0}
+        run: |
+          import os
+          import pathlib
+          import sys
+          import tarfile
+
+          if sys.version_info < (3, 12):
+              raise RuntimeError("Python 3.12 or newer is required for safe bundle extraction.")
+          root = pathlib.Path(os.environ["SIGNING_TEMP"])
+          root.mkdir(mode=0o700)
+          with tarfile.open(pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-input/unsigned-app.tar") as archive:
+              if any(pathlib.PurePosixPath(member.name).name.startswith("._") for member in archive):
+                  raise RuntimeError("The unsigned archive contains unsupported AppleDouble metadata.")
+              archive.extractall(root / "products", filter="data")
+          products = root / "products"
+          app = products / (os.environ["APP_NAME"] + ".app")
+          if list(products.iterdir()) != [app] or app.is_symlink() or not app.is_dir():
+              raise RuntimeError("The artifact must contain exactly the requested application bundle.")
+
+      - name: Sign in to Azure with OIDC
+        id: azure-login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Sign and notarize native app
+        env:
+          VAULT_URI: ${{ vars.AZURE_KEY_VAULT_URI }}
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+        shell: python3 {0}
+        run: |
+          import base64
+          import json
+          import os
+          import pathlib
+          import plistlib
+          import re
+          import secrets
+          import shlex
+          import subprocess
+
+          def run(arguments, *, input=None, env=None, timeout=120):
+              result = subprocess.run(arguments, input=input, env=env, text=True,
+                                      capture_output=True, timeout=timeout)
+              if result.returncode:
+                  raise RuntimeError(f"{pathlib.Path(arguments[0]).name} failed "
+                                     f"(exit {result.returncode}); protected output withheld.")
+              return result.stdout
+
+          def mask(value):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::add-mask::" + escaped, flush=True)
+
+          def fetch_secret(vault, name):
+              value = run(["az", "keyvault", "secret", "show",
+                           "--id", f"{vault}/secrets/{name}", "--query", "value", "--output", "json"])
+              value = json.loads(value)
+              if not isinstance(value, str) or not value:
+                  raise RuntimeError(f"Required Key Vault secret '{name}' is empty.")
+              mask(value)
+              return value
+
+          def security(arguments):
+              # Only generated hex passwords reach security's non-shell stdin parser.
+              run(["/usr/bin/security", "-i"], input=shlex.join(arguments) + "\n")
+
+          def import_identity(root, certificate, password):
+              keychain = root / "signing.keychain-db"
+              keychain_password = secrets.token_hex(32)
+              import_password = secrets.token_hex(32)
+              mask(keychain_password)
+              mask(import_password)
+              (root / "keychains.json").write_text(json.dumps(shlex.split(
+                  run(["/usr/bin/security", "list-keychains", "-d", "user"]))))
+              original = root / "certificate.p12"
+              original.write_bytes(base64.b64decode(certificate, validate=True))
+              pem = root / "certificate.pem"
+              repacked = root / "import.p12"
+              environment = dict(os.environ, CERTIFICATE_PASSWORD=password, IMPORT_PASSWORD=import_password)
+              run(["/usr/bin/openssl", "pkcs12", "-in", str(original), "-nodes",
+                   "-passin", "env:CERTIFICATE_PASSWORD", "-out", str(pem)], env=environment)
+              run(["/usr/bin/openssl", "pkcs12", "-export", "-in", str(pem),
+                   "-out", str(repacked), "-passout", "env:IMPORT_PASSWORD"], env=environment)
+              security(["create-keychain", "-p", keychain_password, str(keychain)])
+              run(["/usr/bin/security", "set-keychain-settings", "-lut", "3600", str(keychain)])
+              security(["unlock-keychain", "-p", keychain_password, str(keychain)])
+              security(["import", str(repacked), "-k", str(keychain), "-P", import_password,
+                        "-T", "/usr/bin/codesign"])
+              security(["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
+                        "-s", "-k", keychain_password, str(keychain)])
+              for path in (original, pem, repacked):
+                  path.unlink()
+              return keychain
+
+          def code_objects(app):
+              objects = []
+              for path in app.rglob("*"):
+                  if path.is_symlink():
+                      continue
+                  if path.suffix in (".app", ".appex", ".xpc"):
+                      raise RuntimeError("Nested applications, extensions, and XPC services are not supported.")
+                  if path.is_dir() and (path.suffix == ".framework" or (
+                          path.suffix == ".bundle" and
+                          ((path / "Contents/Info.plist").is_file() or (path / "Info.plist").is_file()))):
+                      objects.append(path)
+                  elif path.is_file():
+                      with path.open("rb") as stream:
+                          magic = stream.read(4)
+                      if magic in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+                                   b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+                                   b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                                   b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+                          architectures = run(["/usr/bin/lipo", "-archs", str(path)]).split()
+                          if not {"arm64", "x86_64"}.issubset(architectures):
+                              raise RuntimeError("Every Mach-O must contain arm64 and x86_64 slices.")
+                          objects.append(path)
+              return sorted(objects, key=lambda path: len(path.parts), reverse=True) + [app]
+
+          def notarize(app, root, keychain, password):
+              if any(character in password for character in "\r\n\0"):
+                  raise RuntimeError("The notarization password must be a single line.")
+              run(["/usr/bin/xcrun", "notarytool", "store-credentials", "native-release",
+                   "--apple-id", os.environ["APPLE_ID"], "--team-id", os.environ["APPLE_TEAM_ID"],
+                   "--keychain", str(keychain)], input=password + "\n")
+              submission = root / "submission.zip"
+              run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(submission)])
+              result = json.loads(run(["/usr/bin/xcrun", "notarytool", "submit", str(submission),
+                                       "--keychain-profile", "native-release", "--keychain", str(keychain),
+                                       "--wait", "--timeout", "15m", "--output-format", "json"], timeout=960))
+              if result.get("status") != "Accepted":
+                  raise RuntimeError("Apple did not accept the notarization submission.")
+              run(["/usr/bin/xcrun", "stapler", "staple", str(app)])
+              run(["/usr/bin/xcrun", "stapler", "validate", str(app)])
+              run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+              run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(app)])
+
+          def main():
+              os.umask(0o077)
+              root = pathlib.Path(os.environ["SIGNING_TEMP"])
+              if not re.fullmatch(r"/[A-Za-z0-9/_.-]+", str(root)):
+                  raise RuntimeError("The temporary signing path contains unsupported characters.")
+              vault = os.environ["VAULT_URI"].rstrip("/")
+              if not re.fullmatch(r"https://[a-z][a-z0-9-]{1,22}[a-z0-9]\.vault\.azure\.net", vault):
+                  raise RuntimeError("AZURE_KEY_VAULT_URI is missing or invalid.")
+              for name in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_SIGNING_IDENTITY"):
+                  if not os.environ[name]:
+                      raise RuntimeError(f"{name} must be configured in the release environment.")
+              identity = os.environ["APPLE_SIGNING_IDENTITY"]
+              team = os.environ["APPLE_TEAM_ID"]
+              if not re.fullmatch(r"[A-Z0-9]{10}", team):
+                  raise RuntimeError("APPLE_TEAM_ID must be a ten-character Apple Team ID.")
+              if not identity.startswith("Developer ID Application: ") or not identity.endswith(f"({team})"):
+                  raise RuntimeError("APPLE_SIGNING_IDENTITY must be a Developer ID Application for APPLE_TEAM_ID.")
+              app = root / "products" / (os.environ["APP_NAME"] + ".app")
+              with (app / "Contents/Info.plist").open("rb") as stream:
+                  info = plistlib.load(stream)
+              if info.get("CFBundleShortVersionString") != os.environ["GITHUB_REF_NAME"][1:]:
+                  raise RuntimeError("The application version does not match the release tag.")
+              if str(info.get("CFBundleVersion")) != os.environ["GITHUB_RUN_NUMBER"]:
+                  raise RuntimeError("The application build version does not match the run number.")
+              objects = code_objects(app)
+              keychain = import_identity(root, fetch_secret(vault, "apple-developer-id-certificate"),
+                                         fetch_secret(vault, "apple-developer-id-password"))
+              identities = run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning", str(keychain)])
+              if f'"{identity}"' not in identities:
+                  raise RuntimeError("The vault certificate does not contain the configured valid signing identity.")
+              for path in objects:
+                  run(["/usr/bin/codesign", "--force", "--sign", identity, "--keychain", str(keychain),
+                       "--options", "runtime", "--timestamp", str(path)])
+              run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+              run(["/usr/bin/codesign", "--verify", "--strict", "-R",
+                   '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
+                   f'and certificate leaf[subject.OU] = "{team}"', str(app)])
+              notarize(app, root, keychain, fetch_secret(vault, "apple-notarization-password"))
+              output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release"
+              output.mkdir(mode=0o700)
+              asset = output / f'{os.environ["APP_NAME"]}-{os.environ["GITHUB_REF_NAME"]}-universal-macos.zip'
+              run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(asset)])
+
+          if __name__ == "__main__":
+              main()
+
+      - name: Remove temporary native credentials
+        if: always()
+        shell: python3 {0}
+        run: |
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          root = pathlib.Path(os.environ["SIGNING_TEMP"])
+          if root.parent != pathlib.Path(os.environ["RUNNER_TEMP"]) or not root.name.startswith("native-signing-"):
+              raise RuntimeError("Refusing to clean an unexpected signing directory.")
+          errors = []
+          keychain = root / "signing.keychain-db"
+          if keychain.exists():
+              result = subprocess.run(["/usr/bin/security", "delete-keychain", str(keychain)],
+                                      capture_output=True)
+              if result.returncode:
+                  errors.append("Unable to delete the temporary signing keychain.")
+          snapshot = root / "keychains.json"
+          if snapshot.exists():
+              result = subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s",
+                                       *json.loads(snapshot.read_text())], capture_output=True)
+              if result.returncode:
+                  errors.append("Unable to restore the keychain search list.")
+          for name in ("certificate.p12", "certificate.pem", "import.p12"):
+              (root / name).unlink(missing_ok=True)
+          if not errors and root.exists():
+              shutil.rmtree(root)
+          if errors:
+              raise RuntimeError(" ".join(errors))
+
+      - name: Clear Azure session
+        if: always() && steps.azure-login.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az logout
+          az account clear
+
+      - name: Create or update release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NAME: ${{ inputs.release-name || format('{0} {1}', github.event.repository.name, github.ref_name) }}
+          RELEASE_BODY: ${{ inputs.release-body }}
+          RELEASE_DRAFT: ${{ inputs.release-draft }}
+        shell: python3 {0}
+        run: |
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          def gh(arguments):
+              return subprocess.run(["gh", *arguments], text=True, capture_output=True, check=True).stdout
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          asset = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release" / (
+              f'{os.environ["APP_NAME"]}-{tag}-universal-macos.zip')
+          if not asset.is_file():
+              raise RuntimeError("The signed release asset is missing.")
+          pages = json.loads(gh(["api", "--paginate", "--slurp", f"repos/{repository}/releases"]))
+          matches = [release for page in pages for release in page if release["tag_name"] == tag]
+          if len(matches) > 1:
+              raise RuntimeError("Multiple releases already use this tag; operator review is required.")
+          if matches and not matches[0]["draft"]:
+              raise RuntimeError("Refusing to replace assets on an already published release.")
+          if not matches:
+              notes = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release-notes.txt"
+              notes.write_text(os.environ["RELEASE_BODY"])
+              gh(["release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
+                  "--title", os.environ["RELEASE_NAME"], "--notes-file", str(notes), "--generate-notes"])
+          gh(["release", "upload", tag, str(asset), "--repo", repository, "--clobber"])
+          if os.environ["RELEASE_DRAFT"] == "false":
+              gh(["release", "edit", tag, "--repo", repository, "--draft=false"])

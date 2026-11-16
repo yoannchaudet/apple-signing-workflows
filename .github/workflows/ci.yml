@@ -51,6 +51,21 @@ jobs:
         shell: pwsh
         run: Invoke-Pester -Path tests -CI
 
+      - name: Test native workflow
+        run: python3 -B tests/native_workflow_test.py
+
       - name: Guard tracked content
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -File tests/Test-TrackedContent.ps1
+
+  native-credentials:
+    name: Native credential interfaces
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Test disposable native credentials without Apple requests
+        run: python3 -B tests/native_workflow_test.py
