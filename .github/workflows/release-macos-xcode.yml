@@ -199,11 +199,53 @@ jobs:
           import subprocess
 
           def run(arguments, *, input=None, env=None, timeout=120):
-              result = subprocess.run(arguments, input=input, env=env, text=True,
-                                      capture_output=True, timeout=timeout)
+              try:
+                  result = subprocess.run(arguments, input=input, env=env, text=True,
+                                          capture_output=True, timeout=timeout)
+              except subprocess.TimeoutExpired:
+                  raise RuntimeError(f"{pathlib.Path(arguments[0]).name} timed out; "
+                                     "protected output withheld.") from None
               if result.returncode:
                   raise RuntimeError(f"{pathlib.Path(arguments[0]).name} failed "
                                      f"(exit {result.returncode}); protected output withheld.")
+              return result.stdout
+
+          def codesign(options, *, operation, path, app):
+              relative = path.relative_to(app).as_posix()
+              target = json.dumps(relative[:120] + ("..." if len(relative) > 120 else ""))
+              try:
+                  result = subprocess.run(["/usr/bin/codesign", *options, str(path)], text=True,
+                                          errors="replace", capture_output=True, timeout=120)
+              except subprocess.TimeoutExpired:
+                  raise RuntimeError(f"codesign {operation} timed out for bundle target {target}; "
+                                     "protected output withheld.") from None
+              if result.returncode:
+                  output = (result.stdout[:8192] + "\n" + result.stderr[:8192]).casefold()
+                  # Emit fixed phrases only, never raw lines, paths, or signer metadata.
+                  diagnostics = [phrase for phrase in (
+                      "errSecInternalComponent",
+                      "CSSMERR_TP_NOT_TRUSTED",
+                      "User interaction is not allowed",
+                      "The specified item could not be found in the keychain",
+                      "unable to build chain to self-signed root",
+                      "no identity found",
+                      "The timestamp service is not available",
+                      "A timestamp was expected but was not found",
+                      "Operation not permitted",
+                      "resource fork, Finder information, or similar detritus not allowed",
+                      "bundle format unrecognized, invalid, or unsuitable",
+                      "bundle format is ambiguous",
+                      "code object is not signed at all",
+                      "a sealed resource is missing or invalid",
+                      "invalid signature (code or signature have been modified)",
+                      "nested code is modified or invalid",
+                      "unsealed contents present in the root directory of an embedded framework",
+                      "internal error in Code Signing subsystem",
+                  ) if phrase.casefold() in output][:4]
+                  detail = ("codesign reported: " + "; ".join(diagnostics) if diagnostics else
+                            "unrecognized diagnostic; protected output withheld.")
+                  raise RuntimeError(f"codesign {operation} failed for bundle target {target} "
+                                     f"(exit {result.returncode}); {detail}")
               return result.stdout
 
           def mask(value):
@@ -290,7 +332,8 @@ jobs:
                   raise RuntimeError("Apple did not accept the notarization submission.")
               run(["/usr/bin/xcrun", "stapler", "staple", str(app)])
               run(["/usr/bin/xcrun", "stapler", "validate", str(app)])
-              run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+              codesign(["--verify", "--deep", "--strict"],
+                       operation="verify stapled bundle", path=app, app=app)
               run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(app)])
 
           def main():
@@ -324,13 +367,15 @@ jobs:
               if f'"{identity}"' not in identities:
                   raise RuntimeError("The vault certificate does not contain the configured valid signing identity.")
               for path in objects:
-                  run(["/usr/bin/codesign", "--force", "--sign", identity, "--keychain", str(keychain),
-                       "--options", "runtime", "--timestamp", str(path)])
-              run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
-              run(["/usr/bin/codesign", "--verify", "--strict", "-R",
+                  codesign(["--force", "--sign", identity, "--keychain", str(keychain),
+                            "--options", "runtime", "--timestamp"], operation="sign", path=path, app=app)
+              codesign(["--verify", "--deep", "--strict"],
+                       operation="verify signed bundle", path=app, app=app)
+              codesign(["--verify", "--strict", "-R",
                    '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
                    'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
-                   f'and certificate leaf[subject.OU] = "{team}"', str(app)])
+                   f'and certificate leaf[subject.OU] = "{team}"'],
+                   operation="verify Developer ID", path=app, app=app)
               notarize(app, root, keychain, fetch_secret(vault, "apple-notarization-password"))
               output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-release"
               output.mkdir(mode=0o700)

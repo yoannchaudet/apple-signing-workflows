@@ -38,6 +38,21 @@ the application, dependencies, and workflow before approving the signing environ
 Local synthetic credential tests prove import and stdin handling without sending Apple
 requests; they do not replace this production gate.
 
+## Native signing diagnostics and recovery
+
+Native signing errors identify the operation and an escaped, length-limited path relative
+to the application bundle. Only fixed, recognized `codesign` diagnostic phrases appear;
+raw output, signer metadata, absolute paths, and unknown diagnostics remain withheld.
+Other subprocess failures retain blanket output protection. A diagnostic identifies what
+the tool reported, not an independently established root cause.
+
+A tagged caller pins an immutable shared workflow commit. Updating the shared workflow
+or the caller's default branch does not update an existing tag or its reruns. After a
+reviewed fix is published, update the caller's pin and use its normal new-version release
+process. Do not move an existing release tag. Recovering an unreleased version through a
+separate workflow requires explicit review and approval, including the source commit,
+version checks, shared workflow SHA, signing environment, and release destination.
+
 Audit the complete repository history before changing this repository from private to
 public. Public visibility is required for public callers.
 
