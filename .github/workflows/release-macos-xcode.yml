@@ -15,6 +15,56 @@ on:
         description: Application product name without the .app suffix
         required: true
         type: string
+      dmg-background-path:
+        description: Optional 1x PNG path relative to working-directory
+        required: false
+        type: string
+        default: ""
+      dmg-background-2x-path:
+        description: Optional 2x PNG path relative to working-directory
+        required: false
+        type: string
+        default: ""
+      dmg-window-width:
+        description: Finder window width in points when artwork is enabled
+        required: false
+        type: number
+        default: 680
+      dmg-window-height:
+        description: Finder window height including title bar in points when artwork is enabled
+        required: false
+        type: number
+        default: 428
+      dmg-icon-size:
+        description: Finder icon size in points when artwork is enabled
+        required: false
+        type: number
+        default: 120
+      dmg-text-size:
+        description: Finder icon label text size in points when artwork is enabled
+        required: false
+        type: number
+        default: 13
+      dmg-app-x:
+        description: Center x coordinate for the application icon in points
+        required: false
+        type: number
+        default: 180
+      dmg-app-y:
+        description: Center y coordinate for the application icon in points
+        required: false
+        type: number
+        default: 170
+      dmg-applications-x:
+        description: Center x coordinate for the Applications icon in points
+        required: false
+        type: number
+        default: 500
+      dmg-applications-y:
+        description: Center y coordinate for the Applications icon in points
+        required: false
+        type: number
+        default: 170
       working-directory:
         description: Directory containing the XcodeGen project.yml
         required: false
@@ -43,7 +93,12 @@ jobs:
   build:
     name: Build unsigned universal app
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
+    outputs:
+      app-sha256: ${{ steps.package.outputs.app-sha256 }}
+      ds-store-sha256: ${{ steps.package.outputs.ds-store-sha256 }}
+      background-sha256: ${{ steps.package.outputs.background-sha256 }}
+      layout-enabled: ${{ steps.package.outputs.layout-enabled }}
     env:
       PROJECT: ${{ inputs.project }}
       SCHEME: ${{ inputs.scheme }}
@@ -112,15 +167,284 @@ jobs:
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             INFOPLIST_KEY_CFBundleShortVersionString="${GITHUB_REF_NAME#v}" \
             INFOPLIST_KEY_CFBundleVersion="$GITHUB_RUN_NUMBER" build
-          products="$RUNNER_TEMP/native-build/Build/Products/Release"
-          test -d "$products/$APP_NAME.app"
-          COPYFILE_DISABLE=1 tar -cf "$RUNNER_TEMP/unsigned-app.tar" -C "$products" "$APP_NAME.app"
+
+      - name: Package unsigned app and optional Finder layout
+        id: package
+        working-directory: ${{ inputs.working-directory }}
+        timeout-minutes: 30
+        env:
+          DMG_BACKGROUND_PATH: ${{ inputs.dmg-background-path }}
+          DMG_BACKGROUND_2X_PATH: ${{ inputs.dmg-background-2x-path }}
+          DMG_WINDOW_WIDTH: ${{ inputs.dmg-window-width }}
+          DMG_WINDOW_HEIGHT: ${{ inputs.dmg-window-height }}
+          DMG_ICON_SIZE: ${{ inputs.dmg-icon-size }}
+          DMG_TEXT_SIZE: ${{ inputs.dmg-text-size }}
+          DMG_APP_X: ${{ inputs.dmg-app-x }}
+          DMG_APP_Y: ${{ inputs.dmg-app-y }}
+          DMG_APPLICATIONS_X: ${{ inputs.dmg-applications-x }}
+          DMG_APPLICATIONS_Y: ${{ inputs.dmg-applications-y }}
+        shell: python3 {0}
+        run: |
+          import hashlib
+          import os
+          from pathlib import Path, PurePosixPath
+          import plistlib
+          import re
+          import shutil
+          import subprocess
+          import tarfile
+
+          def run(arguments, *, input=None, timeout=120):
+              try:
+                  result = subprocess.run(arguments, input=input, text=True, capture_output=True, timeout=timeout)
+              except subprocess.TimeoutExpired:
+                  raise RuntimeError(f"{Path(arguments[0]).name} timed out; protected output withheld.") from None
+              if result.returncode:
+                  raise RuntimeError(f"{Path(arguments[0]).name} failed (exit {result.returncode}); "
+                                     "protected output withheld.")
+              return result.stdout
+
+          def integer(name, minimum, maximum):
+              value = os.environ[name]
+              if not re.fullmatch(r"[0-9]+", value):
+                  raise RuntimeError(f"{name} must be an integer.")
+              value = int(value)
+              if not minimum <= value <= maximum:
+                  raise RuntimeError(f"{name} is outside the supported range.")
+              return value
+
+          def relative_input(name, root):
+              value = os.environ[name]
+              path = PurePosixPath(value)
+              if (not value or path.is_absolute() or "\\" in value or ":" in value
+                      or any(part in ("", ".", "..") for part in path.parts)):
+                  raise RuntimeError(f"{name} must be a safe relative path.")
+              candidate = root
+              for part in path.parts:
+                  candidate = candidate / part
+                  if candidate.is_symlink():
+                      raise RuntimeError(f"{name} must not use symbolic links.")
+              try:
+                  resolved = candidate.resolve(strict=True)
+              except (FileNotFoundError, NotADirectoryError):
+                  raise RuntimeError(f"{name} must identify an existing file.") from None
+              if not resolved.is_relative_to(root) or not resolved.is_file():
+                  raise RuntimeError(f"{name} must identify a regular file under working-directory.")
+              if resolved.stat().st_size == 0:
+                  raise RuntimeError(f"{name} must be a non-empty file.")
+              if resolved.stat().st_size > 20 * 1024 * 1024:
+                  raise RuntimeError(f"{name} must be no larger than 20 MiB.")
+              with resolved.open("rb") as stream:
+                  if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+                      raise RuntimeError(f"{name} must contain a PNG image.")
+              return resolved
+
+          def png_size(path):
+              output = run(["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)])
+              dimensions = re.findall(r"pixel(Width|Height):\s*([0-9]+)", output)
+              values = {name: int(value) for name, value in dimensions}
+              if set(values) != {"Width", "Height"}:
+                  raise RuntimeError("Unable to read background PNG dimensions.")
+              return values["Width"], values["Height"]
+
+          def digest(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          app_name = os.environ["APP_NAME"]
+          root = Path.cwd().resolve()
+          products = Path(os.environ["RUNNER_TEMP"]) / "native-build/Build/Products/Release"
+          app = products / (app_name + ".app")
+          if app.is_symlink() or not app.is_dir():
+              raise RuntimeError("The Xcode build did not produce the requested application bundle.")
+          output = Path(os.environ["RUNNER_TEMP"])
+          archive_path = output / "unsigned-app.tar"
+          with tarfile.open(archive_path, "w") as archive:
+              archive.add(app, arcname=app.name, recursive=True)
+
+          background = os.environ["DMG_BACKGROUND_PATH"]
+          background_2x = os.environ["DMG_BACKGROUND_2X_PATH"]
+          if bool(background) != bool(background_2x):
+              raise RuntimeError("Both 1x and 2x DMG backgrounds must be provided together.")
+
+          layout = output / "finder-layout.dmg"
+          if background:
+              one_x = relative_input("DMG_BACKGROUND_PATH", root)
+              two_x = relative_input("DMG_BACKGROUND_2X_PATH", root)
+              width = integer("DMG_WINDOW_WIDTH", 160, 10000)
+              height = integer("DMG_WINDOW_HEIGHT", 100, 10000)
+              icon_size = integer("DMG_ICON_SIZE", 16, 512)
+              text_size = integer("DMG_TEXT_SIZE", 8, 32)
+              app_x = integer("DMG_APP_X", 0, width)
+              app_y = integer("DMG_APP_Y", 0, height)
+              applications_x = integer("DMG_APPLICATIONS_X", 0, width)
+              applications_y = integer("DMG_APPLICATIONS_Y", 0, height)
+              one_width, one_height = png_size(one_x)
+              two_width, two_height = png_size(two_x)
+              if (one_width != width or two_width != width * 2 or two_height != one_height * 2
+                      or height < one_height + 28):
+                  raise RuntimeError("DMG artwork must be exact 1x/2x sizes and fit below the Finder title bar.")
+              source = output / "finder-layout-source"
+              mount = output / "finder-layout-mount"
+              if source.exists() or source.is_symlink() or mount.exists() or mount.is_symlink():
+                  raise RuntimeError("A Finder layout temporary path already exists.")
+              source.mkdir(mode=0o700)
+              shutil.copytree(app, source / app.name, symlinks=True)
+              (source / "Applications").symlink_to("/Applications", target_is_directory=True)
+              background_dir = source / ".background"
+              background_dir.mkdir(mode=0o755)
+              tiff = background_dir / "background.tiff"
+              run(["/usr/bin/tiffutil", "-cathidpicheck", str(one_x), str(two_x), "-out", str(tiff)])
+              if tiff.stat().st_size == 0 or tiff.stat().st_size > 40 * 1024 * 1024:
+                  raise RuntimeError("The combined Finder background exceeds the supported size.")
+              with tiff.open("rb") as stream:
+                  if stream.read(4) not in (b"II*\x00", b"MM\x00*"):
+                      raise RuntimeError("The combined Finder background is not a TIFF image.")
+
+              layout.unlink(missing_ok=True)
+              run(["/usr/bin/hdiutil", "create", "-volname", app_name, "-srcfolder", str(source),
+                   "-fs", "HFS+", "-format", "UDRW", str(layout)], timeout=600)
+              mount.mkdir(mode=0o700)
+              attached_target = None
+              try:
+                  response = plistlib.loads(run([
+                      "/usr/bin/hdiutil", "attach", str(layout), "-readwrite", "-noverify",
+                      "-noautoopen", "-owners", "on", "-mountpoint", str(mount), "-plist",
+                  ], timeout=120).encode())
+                  entities = response.get("system-entities", [])
+                  attached_target = next(
+                      (entity["mount-point"] for entity in entities if entity.get("mount-point")), None
+                  )
+                  if attached_target is None:
+                      attached_target = next(
+                          (entity["dev-entry"] for entity in entities if entity.get("dev-entry")), None
+                      )
+                  mounted = [entity for entity in entities
+                             if entity.get("mount-point")
+                             and Path(entity["mount-point"]).resolve() == mount.resolve()]
+                  if len(mounted) != 1 or not mount.is_mount():
+                      raise RuntimeError("Unable to mount the temporary Finder layout image.")
+                  script = r'''
+          on run argv
+            set mountPath to item 1 of argv
+            set appBundle to item 2 of argv
+            set windowWidth to (item 3 of argv) as integer
+            set windowHeight to (item 4 of argv) as integer
+            set iconSize to (item 5 of argv) as integer
+            set textSize to (item 6 of argv) as integer
+            set appX to (item 7 of argv) as integer
+            set appY to (item 8 of argv) as integer
+            set applicationsX to (item 9 of argv) as integer
+            set applicationsY to (item 10 of argv) as integer
+            tell application "Finder"
+              activate
+              open (POSIX file mountPath as alias)
+              delay 1
+              set dmgWindow to front window
+              set target of dmgWindow to (POSIX file mountPath as alias)
+              set current view of dmgWindow to icon view
+              set toolbar visible of dmgWindow to false
+              set sidebar width of dmgWindow to 0
+              set statusbar visible of dmgWindow to false
+              set pathbar visible of dmgWindow to false
+              set bounds of dmgWindow to {200, 120, 200 + windowWidth, 120 + windowHeight}
+              set arrangement of icon view options of dmgWindow to not arranged
+              set icon size of icon view options of dmgWindow to iconSize
+              set text size of icon view options of dmgWindow to textSize
+              set background picture of icon view options of dmgWindow to ¬
+                (POSIX file (mountPath & "/.background/background.tiff") as alias)
+              set position of item appBundle of dmgWindow to {appX, appY}
+              set position of item "Applications" of dmgWindow to {applicationsX, applicationsY}
+              delay 2
+              if toolbar visible of dmgWindow or sidebar width of dmgWindow is not 0 or ¬
+                  statusbar visible of dmgWindow or pathbar visible of dmgWindow then error "Finder chrome remained visible."
+              close dmgWindow
+              delay 2
+              open (POSIX file mountPath as alias)
+              delay 1
+              set dmgWindow to front window
+              if (bounds of dmgWindow) is not {200, 120, 200 + windowWidth, 120 + windowHeight} then ¬
+                error "Finder did not persist the requested window bounds."
+              if toolbar visible of dmgWindow or sidebar width of dmgWindow is not 0 or ¬
+                  statusbar visible of dmgWindow or pathbar visible of dmgWindow then error "Finder did not persist hidden chrome."
+              if (icon size of icon view options of dmgWindow) is not iconSize or ¬
+                  (text size of icon view options of dmgWindow) is not textSize then error "Finder did not persist icon settings."
+              if (position of item appBundle of dmgWindow) is not {appX, appY} or ¬
+                  (position of item "Applications" of dmgWindow) is not {applicationsX, applicationsY} then ¬
+                error "Finder did not persist icon positions."
+              close dmgWindow
+            end tell
+          end run
+          '''
+                  run(["/usr/bin/osascript", "-", str(mount), app.name, str(width), str(height),
+                       str(icon_size), str(text_size), str(app_x), str(app_y),
+                       str(applications_x), str(applications_y)], input=script, timeout=180)
+                  run(["/bin/sync"], timeout=60)
+              finally:
+                  if mount.is_mount():
+                      attached_target = str(mount)
+                  if attached_target:
+                      run(["/usr/bin/hdiutil", "detach", attached_target], timeout=120)
+
+              attached_target = None
+              try:
+                  response = plistlib.loads(run([
+                      "/usr/bin/hdiutil", "attach", str(layout), "-readonly", "-nobrowse",
+                      "-noverify", "-noautoopen", "-owners", "on", "-mountpoint", str(mount), "-plist",
+                  ], timeout=120).encode())
+                  entities = response.get("system-entities", [])
+                  attached_target = next(
+                      (entity["mount-point"] for entity in entities if entity.get("mount-point")), None
+                  )
+                  if attached_target is None:
+                      attached_target = next(
+                          (entity["dev-entry"] for entity in entities if entity.get("dev-entry")), None
+                      )
+                  mounted = [entity for entity in entities
+                             if entity.get("mount-point")
+                             and Path(entity["mount-point"]).resolve() == mount.resolve()]
+                  if len(mounted) != 1 or not mount.is_mount():
+                      raise RuntimeError("Unable to reopen the Finder layout image.")
+                  ds_store = mount / ".DS_Store"
+                  if ds_store.is_symlink() or not ds_store.is_file() or not 16 <= ds_store.stat().st_size <= 2 * 1024 * 1024:
+                      raise RuntimeError("Finder did not save a bounded .DS_Store layout.")
+                  with ds_store.open("rb") as stream:
+                      if stream.read(8)[4:] != b"Bud1":
+                          raise RuntimeError("Finder saved an invalid .DS_Store layout.")
+                      content = stream.read()
+                  if any(record not in content for record in (b"pBBk", b"bwsp", b"Iloc")):
+                      raise RuntimeError("Finder did not save the requested layout records.")
+                  payload = output / "finder-layout"
+                  (payload / ".background").mkdir(parents=True, mode=0o700)
+                  shutil.copy2(ds_store, payload / ".DS_Store")
+                  shutil.copy2(mount / ".background/background.tiff", payload / ".background/background.tiff")
+              finally:
+                  if mount.is_mount():
+                      attached_target = str(mount)
+                  if attached_target:
+                      run(["/usr/bin/hdiutil", "detach", attached_target], timeout=120)
+              shutil.rmtree(source)
+              shutil.rmtree(mount)
+
+          app_hash = digest(archive_path)
+          ds_store_hash = digest(payload / ".DS_Store") if background else ""
+          background_hash = digest(payload / ".background/background.tiff") if background else ""
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output_file:
+              output_file.write(f"app-sha256={app_hash}\n")
+              output_file.write(f"ds-store-sha256={ds_store_hash}\n")
+              output_file.write(f"background-sha256={background_hash}\n")
+              output_file.write(f"layout-enabled={str(bool(background)).lower()}\n")
 
       - name: Transfer unsigned bundle
+        id: transfer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unsigned-macos-app
-          path: ${{ runner.temp }}/unsigned-app.tar
+          path: |
+            ${{ runner.temp }}/unsigned-app.tar
+            ${{ runner.temp }}/finder-layout/.DS_Store
+            ${{ runner.temp }}/finder-layout/.background/background.tiff
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -137,6 +461,11 @@ jobs:
     env:
       AZURE_CORE_OUTPUT: none
       APP_NAME: ${{ inputs.app-name }}
+      DMG_LAYOUT_ENABLED: ${{ inputs.dmg-background-path != '' && inputs.dmg-background-2x-path != '' }}
+      UNSIGNED_APP_SHA256: ${{ needs.build.outputs.app-sha256 }}
+      FINDER_DS_STORE_SHA256: ${{ needs.build.outputs.ds-store-sha256 }}
+      FINDER_BACKGROUND_SHA256: ${{ needs.build.outputs.background-sha256 }}
+      BUILD_LAYOUT_ENABLED: ${{ needs.build.outputs.layout-enabled }}
     steps:
       - name: Set temporary signing path
         shell: bash
@@ -154,8 +483,10 @@ jobs:
       - name: Extract unsigned bundle
         shell: python3 {0}
         run: |
+          import hashlib
           import os
           import pathlib
+          import posixpath
           import sys
           import tarfile
 
@@ -163,11 +494,78 @@ jobs:
               raise RuntimeError("Python 3.12 or newer is required for safe bundle extraction.")
           root = pathlib.Path(os.environ["SIGNING_TEMP"])
           root.mkdir(mode=0o700)
-          with tarfile.open(pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-input/unsigned-app.tar") as archive:
-              if any(pathlib.PurePosixPath(member.name).name.startswith("._") for member in archive):
+          input_dir = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-input"
+          archive_path = input_dir / "unsigned-app.tar"
+          metadata_dir = input_dir / "finder-layout"
+          expected_layout = os.environ["DMG_LAYOUT_ENABLED"] == "true"
+          if expected_layout != (os.environ["BUILD_LAYOUT_ENABLED"] == "true"):
+              raise RuntimeError("The unsigned artifact layout does not match the requested workflow inputs.")
+          expected_files = {"unsigned-app.tar", "finder-layout"} \
+              if expected_layout else {"unsigned-app.tar"}
+          if {path.name for path in input_dir.iterdir()} != expected_files:
+              raise RuntimeError("The unsigned artifact contains unexpected files.")
+          if archive_path.is_symlink() or not archive_path.is_file():
+              raise RuntimeError("The unsigned app artifact must be a regular file.")
+          for path, expected in ((archive_path, os.environ["UNSIGNED_APP_SHA256"]),):
+              with path.open("rb") as stream:
+                  actual = hashlib.file_digest(stream, "sha256").hexdigest()
+              if not expected or actual != expected:
+                  raise RuntimeError("The unsigned app artifact digest does not match the build job output.")
+          if expected_layout:
+              if metadata_dir.is_symlink() or not metadata_dir.is_dir() or {
+                      path.relative_to(metadata_dir).as_posix() for path in metadata_dir.rglob("*")
+              } != {".DS_Store", ".background", ".background/background.tiff"}:
+                  raise RuntimeError("The Finder metadata artifact contains unexpected files.")
+              ds_store = metadata_dir / ".DS_Store"
+              background = metadata_dir / ".background/background.tiff"
+              if (ds_store.is_symlink() or not ds_store.is_file()
+                      or (metadata_dir / ".background").is_symlink()
+                      or not (metadata_dir / ".background").is_dir()
+                      or background.is_symlink() or not background.is_file()):
+                  raise RuntimeError("The Finder metadata artifact must contain regular files.")
+              for path, expected in ((ds_store, os.environ["FINDER_DS_STORE_SHA256"]),
+                                     (background, os.environ["FINDER_BACKGROUND_SHA256"])):
+                  with path.open("rb") as stream:
+                      actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                  if not expected or actual != expected:
+                      raise RuntimeError("The Finder metadata digest does not match the build job output.")
+              if not 16 <= ds_store.stat().st_size <= 2 * 1024 * 1024:
+                  raise RuntimeError("The Finder .DS_Store is outside the supported size.")
+              with ds_store.open("rb") as stream:
+                  if stream.read(8)[4:] != b"Bud1":
+                      raise RuntimeError("The Finder .DS_Store has an invalid signature.")
+              if not 4 <= background.stat().st_size <= 40 * 1024 * 1024:
+                  raise RuntimeError("The Finder background is outside the supported size.")
+              with background.open("rb") as stream:
+                  if stream.read(4) not in (b"II*\x00", b"MM\x00*"):
+                      raise RuntimeError("The Finder background is not a TIFF image.")
+
+          app_prefix = os.environ["APP_NAME"] + ".app"
+          with tarfile.open(archive_path) as archive:
+              members = archive.getmembers()
+              names = [member.name.rstrip("/") for member in members]
+              if len(names) != len(set(names)):
+                  raise RuntimeError("The unsigned archive contains duplicate paths.")
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  if (not path.parts or path.is_absolute() or "\\" in member.name
+                          or ".." in path.parts or path.parts[0] != app_prefix
+                          or path.name.startswith("._")):
+                      raise RuntimeError("The unsigned archive contains an unexpected path.")
+                  if member.islnk() or not (member.isdir() or member.isfile() or member.issym()):
+                      raise RuntimeError("The unsigned archive contains an unsupported filesystem entry.")
+                  if member.issym():
+                      target = member.linkname
+                      resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), target))
+                      if target.startswith("/") or resolved != app_prefix and not resolved.startswith(app_prefix + "/"):
+                          raise RuntimeError("The unsigned archive contains an escaping symbolic link.")
+              if not members or not any(member.name.rstrip("/") == app_prefix for member in members):
+                  raise RuntimeError("The unsigned archive does not contain the requested application.")
+              if any(pathlib.PurePosixPath(member.name).name.startswith("._") for member in members):
                   raise RuntimeError("The unsigned archive contains unsupported AppleDouble metadata.")
-              archive.extractall(root / "products", filter="data")
-          products = root / "products"
+              products = root / "products"
+              products.mkdir(mode=0o700)
+              archive.extractall(products, filter="data")
           app = products / (os.environ["APP_NAME"] + ".app")
           if list(products.iterdir()) != [app] or app.is_symlink() or not app.is_dir():
               raise RuntimeError("The artifact must contain exactly the requested application bundle.")
@@ -190,6 +588,8 @@ jobs:
         shell: python3 {0}
         run: |
           import base64
+          import contextlib
+          import hashlib
           import json
           import os
           import pathlib
@@ -197,6 +597,7 @@ jobs:
           import re
           import secrets
           import shlex
+          import shutil
           import stat
           import subprocess
 
@@ -356,7 +757,157 @@ jobs:
                   else:
                       raise RuntimeError("The application contains an unsupported filesystem entry.")
 
-          def create_disk_image(app, root, asset):
+          def bundle_digest(bundle):
+              digest = hashlib.sha256()
+              paths = sorted([bundle, *bundle.rglob("*")],
+                             key=lambda path: path.relative_to(bundle.parent).as_posix())
+              for path in paths:
+                  relative = path.relative_to(bundle.parent).as_posix()
+                  metadata = path.lstat()
+                  if stat.S_ISLNK(metadata.st_mode):
+                      kind = "symlink"
+                      content = os.readlink(path)
+                  elif stat.S_ISDIR(metadata.st_mode):
+                      kind = "directory"
+                      content = ""
+                  elif stat.S_ISREG(metadata.st_mode):
+                      kind = "file"
+                      with path.open("rb") as stream:
+                          content = hashlib.file_digest(stream, "sha256").hexdigest()
+                  else:
+                      raise RuntimeError("The application contains an unsupported filesystem entry.")
+                  attributes = extended_attributes(path)
+                  entry = {
+                      "path": relative,
+                      "type": kind,
+                      "mode": stat.S_IMODE(metadata.st_mode),
+                      "flags": getattr(metadata, "st_flags", 0),
+                      "content": content,
+                      "xattrs": attributes,
+                  }
+                  digest.update(json.dumps(entry, sort_keys=True, separators=(",", ":")).encode())
+                  digest.update(b"\0")
+              return digest.hexdigest()
+
+          def extended_attributes(path):
+              if hasattr(os, "listxattr") and hasattr(os, "getxattr"):
+                  return {
+                      name: os.getxattr(path, name, follow_symlinks=False).hex()
+                      for name in sorted(os.listxattr(path, follow_symlinks=False))
+                  }
+              listed = subprocess.run(["/usr/bin/xattr", "-s", str(path)], capture_output=True)
+              if listed.returncode:
+                  raise RuntimeError("Unable to read application extended attributes.")
+              try:
+                  names = listed.stdout.decode("utf-8").splitlines()
+              except UnicodeDecodeError:
+                  raise RuntimeError("Application extended-attribute names are not valid UTF-8.") from None
+              attributes = {}
+              for name in sorted(names):
+                  result = subprocess.run(
+                      ["/usr/bin/xattr", "-s", "-p", name, str(path)], capture_output=True
+                  )
+                  if result.returncode:
+                      raise RuntimeError("Unable to read an application extended attribute.")
+                  attributes[name] = result.stdout.hex()
+              return attributes
+
+          @contextlib.contextmanager
+          def mounted_image(image, mount, *, readonly):
+              mount.mkdir(mode=0o700)
+              attached_target = None
+              try:
+                  response = plistlib.loads(run([
+                      "/usr/bin/hdiutil", "attach", str(image),
+                      "-readonly" if readonly else "-readwrite", "-noverify", "-noautoopen",
+                      "-owners", "on", "-mountpoint", str(mount), "-plist",
+                  ], timeout=120).encode())
+                  entities = response.get("system-entities", [])
+                  attached_target = next(
+                      (entity["mount-point"] for entity in entities if entity.get("mount-point")), None
+                  )
+                  if attached_target is None:
+                      attached_target = next(
+                          (entity["dev-entry"] for entity in entities if entity.get("dev-entry")), None
+                      )
+                  mounted = [entity for entity in entities
+                             if entity.get("mount-point")
+                             and pathlib.Path(entity["mount-point"]).resolve() == mount.resolve()]
+                  if len(mounted) != 1 or not mount.is_mount():
+                      raise RuntimeError("The disk image did not mount at its requested path.")
+                  yield mounted[0]
+              finally:
+                  if mount.is_mount():
+                      attached_target = str(mount)
+                  if attached_target:
+                      run(["/usr/bin/hdiutil", "detach", attached_target], timeout=120)
+                  if mount.exists():
+                      mount.rmdir()
+
+          def layout_digests(mount, app):
+              expected_names = {app.name, "Applications", ".background", ".DS_Store"}
+              system_names = {".fseventsd", ".Trashes", ".Spotlight-V100", ".TemporaryItems"}
+              names = {path.name for path in mount.iterdir()}
+              if not expected_names.issubset(names) or not names.issubset(expected_names | system_names):
+                  raise RuntimeError("The Finder layout image contains unexpected top-level items.")
+              for name in names & system_names:
+                  system_path = mount / name
+                  if system_path.is_symlink() or not system_path.is_dir():
+                      raise RuntimeError("The Finder layout image contains an invalid system directory.")
+              applications = mount / "Applications"
+              background_dir = mount / ".background"
+              ds_store = mount / ".DS_Store"
+              background = background_dir / "background.tiff"
+              if (not applications.is_symlink() or os.readlink(applications) != "/Applications"
+                      or not background_dir.is_dir() or background_dir.is_symlink()
+                      or {path.name for path in background_dir.iterdir()} != {"background.tiff"}
+                      or background.is_symlink() or not background.is_file()
+                      or ds_store.is_symlink() or not ds_store.is_file()):
+                  raise RuntimeError("The Finder layout image does not contain its exact layout payload.")
+              if not 16 <= ds_store.stat().st_size <= 2 * 1024 * 1024:
+                  raise RuntimeError("The Finder layout .DS_Store is outside the supported size.")
+              with ds_store.open("rb") as stream:
+                  if stream.read(8)[4:] != b"Bud1":
+                      raise RuntimeError("The Finder layout .DS_Store has an invalid signature.")
+              if not 4 <= background.stat().st_size <= 40 * 1024 * 1024:
+                  raise RuntimeError("The Finder background is outside the supported size.")
+              with background.open("rb") as stream:
+                  if stream.read(4) not in (b"II*\x00", b"MM\x00*"):
+                      raise RuntimeError("The Finder background is not a TIFF image.")
+              if app.is_symlink() or not app.is_dir():
+                  raise RuntimeError("The Finder layout does not contain the requested application.")
+              return digest_file(ds_store), digest_file(background)
+
+          def digest_file(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          def verify_disk_image(image, app, root, expected_digest, expected_layout):
+              mount = root / "final-image-mount"
+              with mounted_image(image, mount, readonly=True):
+                  mounted_app = mount / app.name
+                  if mounted_app.is_symlink() or not mounted_app.is_dir():
+                      raise RuntimeError("The final disk image does not contain the requested application.")
+                  expected_names = {app.name, "Applications"}
+                  if expected_layout is not None:
+                      expected_names.update((".DS_Store", ".background"))
+                      actual_layout = layout_digests(mount, app)
+                      if actual_layout != expected_layout:
+                          raise RuntimeError("Finder layout metadata changed during disk image conversion.")
+                  if not expected_names.issubset({path.name for path in mount.iterdir()}):
+                      raise RuntimeError("The final disk image is missing required items.")
+                  if bundle_digest(mounted_app) != expected_digest:
+                      raise RuntimeError("The signed application changed during disk image conversion.")
+                  if os.readlink(mount / "Applications") != "/Applications":
+                      raise RuntimeError("The final disk image has an invalid Applications symlink.")
+                  codesign(["--verify", "--deep", "--strict"],
+                           operation="verify mounted bundle", path=mounted_app, root=mounted_app)
+                  run(["/usr/bin/xcrun", "stapler", "validate", str(mounted_app)])
+                  run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(mounted_app)])
+
+          def create_disk_image(app, root, asset, layout_metadata=None):
+              expected_digest = bundle_digest(app)
+              expected_layout = None
               staging = root / "disk-image"
               staging.mkdir()
               staging.chmod(0o755)
@@ -367,8 +918,24 @@ jobs:
               codesign(["--verify", "--deep", "--strict"],
                        operation="verify staged bundle", path=staged_app, root=staged_app)
               run(["/usr/bin/xcrun", "stapler", "validate", str(staged_app)])
+              if layout_metadata is not None:
+                  ds_store = layout_metadata / ".DS_Store"
+                  background = layout_metadata / ".background/background.tiff"
+                  expected_layout = (digest_file(ds_store), digest_file(background))
+                  if expected_layout != (os.environ["FINDER_DS_STORE_SHA256"],
+                                         os.environ["FINDER_BACKGROUND_SHA256"]):
+                      raise RuntimeError("The Finder metadata changed after artifact validation.")
+                  (staging / ".background").mkdir()
+                  shutil.copyfile(ds_store, staging / ".DS_Store")
+                  shutil.copyfile(background, staging / ".background/background.tiff")
+                  (staging / ".background").chmod(0o755)
+                  (staging / ".DS_Store").chmod(0o644)
+                  (staging / ".background/background.tiff").chmod(0o644)
               run(["/usr/bin/hdiutil", "create", "-volname", app.stem, "-srcfolder", str(staging),
                    "-fs", "HFS+", "-format", "UDZO", str(asset)], timeout=600)
+              if bundle_digest(staged_app) != expected_digest:
+                  raise RuntimeError("Copying the signed app changed its bytes or metadata.")
+              return expected_digest, expected_layout
 
           def verify_developer_id(path, root, team):
               codesign(["--verify", "--strict", "-R",
@@ -425,7 +992,10 @@ jobs:
               asset = output / (basename + ".zip")
               run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(asset)])
               image = output / (basename + ".dmg")
-              create_disk_image(app, root, image)
+              layout_metadata = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-input/finder-layout"
+              if os.environ["DMG_LAYOUT_ENABLED"] != "true":
+                  layout_metadata = None
+              expected_digest, expected_layout = create_disk_image(app, root, image, layout_metadata)
               codesign(["--force", "--sign", identity, "--keychain", str(keychain), "--timestamp"],
                        operation="sign disk image", path=image, root=output)
               verify_developer_id(image, output, team)
@@ -435,6 +1005,7 @@ jobs:
               run(["/usr/bin/hdiutil", "verify", str(image)], timeout=600)
               run(["/usr/sbin/spctl", "--assess", "--type", "open",
                    "--context", "context:primary-signature", str(image)])
+              verify_disk_image(image, app, root, expected_digest, expected_layout)
 
           if __name__ == "__main__":
               main()

@@ -93,11 +93,15 @@ jobs:
       project: Application.xcodeproj
       scheme: Application
       app-name: Application
+      dmg-background-path: installer/background.png
+      dmg-background-2x-path: installer/background@2x.png
 ```
 
 Replace `WORKFLOW_COMMIT_SHA` with the full reviewed commit SHA after that commit is
 published to this repository. A local commit is not available to GitHub Actions. If a
 caller is public, this repository must also be public before that caller can use it.
+Omit both background inputs to keep the existing headless DMG layout. Artwork paths are
+relative to `working-directory`; provide both 1x and 2x PNGs.
 
 The native workflow accepts these inputs:
 
@@ -110,6 +114,14 @@ The native workflow accepts these inputs:
 | `release-name` | No | Repository name and tag | Release title |
 | `release-body` | No | DMG installation and manual-update text | Text before generated release notes |
 | `release-draft` | No | `true` | Keep the release as a draft |
+| `dmg-background-path` | No | Empty | 1x PNG path relative to `working-directory`; requires the 2x path |
+| `dmg-background-2x-path` | No | Empty | 2x PNG path relative to `working-directory`; requires the 1x path |
+| `dmg-window-width` | No | `680` | Finder window width in points |
+| `dmg-window-height` | No | `428` | Finder window height including its title bar |
+| `dmg-icon-size` | No | `120` | Finder icon size in points |
+| `dmg-text-size` | No | `13` | Finder icon-label text size in points |
+| `dmg-app-x`, `dmg-app-y` | No | `180`, `170` | Center coordinates for the app icon |
+| `dmg-applications-x`, `dmg-applications-y` | No | `500`, `170` | Center coordinates for the Applications icon |
 
 It uses the same six `release` environment variables as the Tauri workflow. It reads
 only `apple-developer-id-certificate`, `apple-developer-id-password`, and
@@ -128,13 +140,29 @@ In asset filenames only, spaces in `APP_NAME` become dots to avoid GitHub's uplo
 filename rewriting. Application bundle and volume names keep their spaces.
 
 Both formats preserve executable permissions and framework symlinks and use
-distributable directory and file permissions. The headless DMG uses macOS `hdiutil`
-without Finder automation, custom artwork, or a packaging dependency. After app
-notarization, the workflow signs the DMG with Developer ID and a timestamp, submits
-it separately for notarization, staples and validates its ticket, and verifies its
-signature, team, integrity, and Gatekeeper assessment. This second submission is an
-additional native distribution safeguard, not a requirement for parity with Tauri.
-The release job allows 60 minutes, including two bounded 15-minute notarization waits.
+distributable directory and file permissions. With no background inputs, the DMG
+retains its existing headless `hdiutil` layout. When artwork is enabled, the no-secret
+macOS build job validates both regular PNG files (each at most 20 MiB), combines them
+into a multi-resolution TIFF with the system `tiffutil`, and uses Finder to save and
+reopen a read-write layout image. The persisted layout has a 680×400-point background,
+a 680×428-point window, 120-point icons, 13-point labels, app and Applications centers
+at (180,170) and (500,170), and no toolbar, sidebar, status bar, or path bar. The extra
+28 points account for Finder's title bar. The `.DS_Store` and
+`.background/background.tiff` payloads are transferred with SHA-256 checks. The
+signing job creates a fresh compressed image from the verified app and those files,
+without mounting a caller-produced image or running Finder. Finder automation is
+bounded and fails the build if it is unavailable or required layout records are
+missing. Inspect the final image on a clean Mac before publication; record presence
+alone does not establish that Finder renders the artwork.
+
+The workflow does not modify the signed app's FinderInfo or explicitly hide its `.app`
+extension. Finder controls the label; users who globally show all extensions may see
+`.app`. After app notarization, the workflow signs the DMG with
+Developer ID and a timestamp, submits it separately for notarization, staples and
+validates its ticket, and verifies its signature, team, integrity, mounted app, and
+Gatekeeper assessment. This second submission is an additional native distribution
+safeguard, not a requirement for parity with Tauri. The release job allows 60 minutes,
+including two bounded 15-minute notarization waits.
 
 The workflow prepares and verifies both assets before creating or updating a release.
 It computes SHA-256 digests of the final files and checks GitHub's uploaded asset
@@ -147,11 +175,17 @@ release or choose between duplicate releases. Set `release-draft: false` only wh
 automatic publication is intended; the workflow publishes only after both uploads
 pass verification. Upload failures leave the release as a draft.
 
-The intermediate `unsigned-macos-app` Actions artifact contains `unsigned-app.tar`
-and has one-day retention; it is not an installable release asset. Native apps have
-no automatic updater under this contract. Users install new versions manually. The
-workflow does not produce Tauri updater tarballs, `.sig` files, or `latest.json`.
-The Tauri workflow and its updater behavior remain unchanged.
+The intermediate `unsigned-macos-app` Actions artifact has one-day retention and is not
+an installable release asset. It contains `unsigned-app.tar`; when artwork is enabled,
+it also contains Finder's `.DS_Store` and `.background/` payloads. The signing job
+checks each payload against SHA-256 outputs from the build job, then creates a fresh
+compressed image from the verified app and those files. It does not mount a
+caller-produced image while signing credentials are loaded. These hashes detect
+transfer corruption or mismatch, not malicious output from the caller-controlled
+build job.
+Native apps have no automatic updater under this contract. Users install new versions
+manually. The workflow does not produce Tauri updater tarballs, `.sig` files, or
+`latest.json`. The Tauri workflow and its updater behavior remain unchanged.
 
 The supported signing contract excludes custom entitlements, App Sandbox, nested
 applications, app extensions, and XPC services. Such projects need a reviewed signing

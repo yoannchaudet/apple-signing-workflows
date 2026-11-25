@@ -39,10 +39,27 @@ publish a release, and that partial uploads cannot publish a draft. The native w
 deliberately rejects custom entitlements, App Sandbox, and nested apps, extensions,
 or XPC services.
 
-The native build job has no signing environment or OIDC permission. The signing job
-receives a tar archive, safely extracts its data, and does not execute the app or caller
-scripts. This reduces exposure but does not make untrusted release code safe. Review
-the application, dependencies, and workflow before approving the signing environment.
+For a native caller with custom Finder artwork, the no-secret `macos-15` CI job drives
+Finder to save and reopen a synthetic layout and checks the final image's geometry
+and icon positions. The check fails when automation times out; it does not establish
+that Finder renders the background. Before production use, inspect a final signed
+DMG on a clean Mac and verify the complete artwork in light mode. Confirm the
+transferred `.DS_Store` and `.background/background.tiff` survive creation of the
+final compressed image. Verify
+the app's bytes, permissions, symlink targets, extended attributes (including
+FinderInfo), and codesign verification are unchanged in the final read-only image.
+The workflow does not set the app's hidden-extension FinderInfo flag; users who show
+all extensions globally may see `.app`.
+
+The native build job has no signing environment or OIDC permission, but it does run
+caller-controlled Xcode build phases and Finder automation when artwork is enabled.
+It validates optional artwork paths, PNG signatures and dimensions, sizes, and layout
+numbers. Digests passed through job outputs are checked before the signing job
+extracts the app or uses the regular Finder metadata files to create a fresh final
+image. It does not mount a caller-produced image while signing credentials are
+available. These checks detect transfer mismatch, not a compromised build job.
+Review the application, dependencies, and workflow before approving the signing
+environment.
 Local synthetic credential tests prove import and stdin handling without sending Apple
 requests; they do not replace this production gate.
 
