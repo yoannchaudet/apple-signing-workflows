@@ -10,11 +10,14 @@ import secrets
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import types
 import unittest
+import zlib
 from unittest.mock import patch
 
 
@@ -40,6 +43,38 @@ def signing_module():
 
 
 @contextlib.contextmanager
+def working_directory(path):
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def execute_step(name, environment):
+    module = types.ModuleType("embedded_step")
+    with patch.dict(os.environ, environment):
+        exec(compile(step_script(name), str(WORKFLOW), "exec"), module.__dict__)
+    return module
+
+
+def write_png(path, width, height):
+    def chunk(name, data):
+        body = name + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    row = b"\x00" + bytes((48, 96, 144)) * width
+    image = b"".join(row for _ in range(height))
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(image))
+        + chunk(b"IEND", b"")
+    )
+
+
+@contextlib.contextmanager
 def native_fixture():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory) / "native-signing-test"
@@ -53,7 +88,7 @@ def native_fixture():
                            VAULT_URI="https://" + "synthetic-vault" + ".vault.azure.net",
                            APPLE_ID="synthetic@example.invalid", APPLE_TEAM_ID="SYNTHETIC0",
                            APPLE_SIGNING_IDENTITY="Developer ID Application: Fixture (SYNTHETIC0)",
-                           GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42")
+                           GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42", DMG_LAYOUT_ENABLED="false")
         with patch.dict(os.environ, environment):
             yield root, app
 
@@ -247,6 +282,459 @@ class NativeSigningTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o700)
             self.assertTrue((app / "Contents/directory-link").is_symlink())
 
+    def test_bundle_digest_covers_contents_modes_symlinks_and_extended_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Fixture.app"
+            contents = app / "Contents"
+            contents.mkdir(parents=True)
+            file = contents / "resource"
+            file.write_bytes(b"fixture")
+            first = self.module.bundle_digest(app)
+            file.write_bytes(b"changed")
+            second = self.module.bundle_digest(app)
+            self.assertNotEqual(first, second)
+            file.write_bytes(b"fixture")
+            (contents / "link").symlink_to("resource")
+            self.assertNotEqual(first, self.module.bundle_digest(app))
+            (contents / "link").unlink()
+            file.chmod(0o600)
+            self.assertNotEqual(first, self.module.bundle_digest(app))
+            file.chmod(0o644)
+            if hasattr(os, "setxattr"):
+                attribute = "com.apple.FinderInfo" if sys.platform == "darwin" else "user.fixture"
+                os.setxattr(file, attribute, bytes(32))
+                self.assertNotEqual(first, self.module.bundle_digest(app))
+            elif sys.platform == "darwin":
+                subprocess.run([
+                    "/usr/bin/xattr", "-w", "com.example.fixture", "value", str(file),
+                ], check=True)
+                self.assertNotEqual(first, self.module.bundle_digest(app))
+
+    def test_optional_finder_inputs_and_metadata_contract_are_static_and_fail_closed(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("dmg-background-path:", workflow)
+        self.assertIn("dmg-background-2x-path:", workflow)
+        self.assertIn('default: ""', workflow)
+        self.assertIn('set toolbar visible of dmgWindow to false', workflow)
+        self.assertIn('set sidebar width of dmgWindow to 0', workflow)
+        self.assertIn('set statusbar visible of dmgWindow to false', workflow)
+        self.assertIn('set pathbar visible of dmgWindow to false', workflow)
+        self.assertIn("windowHeight to (item 4 of argv) as integer", workflow)
+        self.assertIn("set position of item appBundle of dmgWindow to {appX, appY}", workflow)
+        self.assertIn('set position of item "Applications" of dmgWindow to {applicationsX, applicationsY}', workflow)
+        self.assertNotIn("SetFile", workflow)
+        self.assertNotIn("extension hidden", workflow.casefold())
+        self.assertNotIn("--hide-extension", workflow)
+        for name in ("Package unsigned app and optional Finder layout",
+                     "Extract unsigned bundle", "Sign and notarize native app"):
+            compile(step_script(name), str(WORKFLOW), "exec")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.environ.get("NATIVE_FINDER_INTEGRATION") == "1",
+        "Requires the hosted macOS Finder integration job",
+    )
+    def test_hosted_finder_layout_persists_without_signing_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "caller"
+            app = root / "runner/native-build/Build/Products/Release/Test App.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": "example.native.fixture",
+                "CFBundlePackageType": "APPL",
+            }))
+            background = workspace / "background.png"
+            background_2x = workspace / "background@2x.png"
+            workspace.mkdir()
+            write_png(background, 680, 400)
+            write_png(background_2x, 1360, 800)
+            output = root / "github-output"
+            environment = {
+                "APP_NAME": "Test App",
+                "RUNNER_TEMP": str(root / "runner"),
+                "GITHUB_OUTPUT": str(output),
+                "DMG_BACKGROUND_PATH": "background.png",
+                "DMG_BACKGROUND_2X_PATH": "background@2x.png",
+                "DMG_WINDOW_WIDTH": "680",
+                "DMG_WINDOW_HEIGHT": "428",
+                "DMG_ICON_SIZE": "120",
+                "DMG_TEXT_SIZE": "13",
+                "DMG_APP_X": "180",
+                "DMG_APP_Y": "170",
+                "DMG_APPLICATIONS_X": "500",
+                "DMG_APPLICATIONS_Y": "170",
+            }
+            with working_directory(workspace):
+                execute_step("Package unsigned app and optional Finder layout", environment)
+            layout = root / "runner/finder-layout.dmg"
+            metadata = root / "runner/finder-layout"
+            self.assertTrue(layout.is_file())
+            self.assertTrue((metadata / ".DS_Store").is_file())
+            self.assertTrue((metadata / ".background/background.tiff").is_file())
+            stored_layout = (metadata / ".DS_Store").read_bytes()
+            for record in (b"pBBk", b"bwsp", b"Iloc"):
+                self.assertIn(record, stored_layout)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["layout-enabled"], "true")
+            self.assertNotIn("layout-sha256", values)
+            self.assertEqual(
+                values["ds-store-sha256"],
+                hashlib.sha256((metadata / ".DS_Store").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                values["background-sha256"],
+                hashlib.sha256((metadata / ".background/background.tiff").read_bytes()).hexdigest(),
+            )
+
+            signing = signing_module()
+            image = root / "final-macos.dmg"
+            mount = root / "final-image-mount"
+            original_run = signing.run
+
+            def run(arguments, **kwargs):
+                if (arguments[1:3] == ["stapler", "validate"]
+                        or arguments[:2] == ["/usr/sbin/spctl", "--assess"]):
+                    return ""
+                return original_run(arguments, **kwargs)
+
+            verify_script = r'''
+          on run argv
+            set mountPath to item 1 of argv
+            set appBundle to item 2 of argv
+            tell application "Finder"
+              activate
+              open (POSIX file mountPath as alias)
+              delay 2
+              set dmgWindow to front window
+              if (bounds of dmgWindow) is not {200, 120, 880, 548} then error "Final Finder bounds changed."
+              if toolbar visible of dmgWindow or sidebar width of dmgWindow is not 0 or ¬
+                  statusbar visible of dmgWindow or pathbar visible of dmgWindow then error "Final Finder chrome changed."
+              if (icon size of icon view options of dmgWindow) is not 120 or ¬
+                  (text size of icon view options of dmgWindow) is not 13 then error "Final Finder icon settings changed."
+              if (position of item appBundle of dmgWindow) is not {180, 170} or ¬
+                  (position of item "Applications" of dmgWindow) is not {500, 170} then error "Final Finder icon positions changed."
+              close dmgWindow
+            end tell
+          end run
+          '''
+            with patch.dict(os.environ, {
+                    "RUNNER_TEMP": str(root),
+                    "FINDER_DS_STORE_SHA256": values["ds-store-sha256"],
+                    "FINDER_BACKGROUND_SHA256": values["background-sha256"],
+            }), patch.object(signing, "codesign"), patch.object(signing, "run", side_effect=run):
+                expected_digest, expected_layout = signing.create_disk_image(
+                    app, root, image, metadata
+                )
+                signing.verify_disk_image(image, app, root, expected_digest, expected_layout)
+                with signing.mounted_image(image, mount, readonly=True):
+                    result = subprocess.run([
+                        "/usr/bin/osascript", "-", str(mount.resolve()), app.name,
+                    ], input=verify_script, text=True, capture_output=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_unsigned_artifact_stays_app_only_and_is_hashed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "caller"
+            app = root / "runner/native-build/Build/Products/Release/Test App.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(b"fixture")
+            outputs = root / "outputs"
+            workspace.mkdir()
+            with working_directory(workspace):
+                environment = {
+                    "APP_NAME": "Test App",
+                    "RUNNER_TEMP": str(root / "runner"),
+                    "GITHUB_OUTPUT": str(outputs),
+                    "DMG_BACKGROUND_PATH": "",
+                    "DMG_BACKGROUND_2X_PATH": "",
+                    "DMG_WINDOW_WIDTH": "680",
+                    "DMG_WINDOW_HEIGHT": "428",
+                    "DMG_ICON_SIZE": "120",
+                    "DMG_TEXT_SIZE": "13",
+                    "DMG_APP_X": "180",
+                    "DMG_APP_Y": "170",
+                    "DMG_APPLICATIONS_X": "500",
+                    "DMG_APPLICATIONS_Y": "170",
+                }
+                execute_step("Package unsigned app and optional Finder layout", environment)
+            archive_path = root / "runner/unsigned-app.tar"
+            with tarfile.open(archive_path) as archive:
+                self.assertTrue(archive.getnames())
+                self.assertTrue(all(name.startswith("Test App.app") for name in archive.getnames()))
+            output_values = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+            self.assertEqual(output_values["layout-enabled"], "false")
+            self.assertNotIn("layout-sha256", output_values)
+            self.assertEqual(output_values["app-sha256"], hashlib.sha256(archive_path.read_bytes()).hexdigest())
+            self.assertFalse((root / "runner/finder-layout.dmg").exists())
+
+    def test_invalid_finder_artwork_inputs_fail_before_packaging(self):
+        for case in ("one-sided", "traversal", "symlink", "missing", "not-directory", "not-png", "empty",
+                     "oversize", "malformed-integer", "fractional", "negative", "too-wide",
+                     "app-below-content", "applications-below-content"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace = root / "caller"
+                workspace.mkdir()
+                app = root / "runner/native-build/Build/Products/Release/Test App.app"
+                (app / "Contents").mkdir(parents=True)
+                (app / "Contents/Info.plist").write_bytes(b"fixture")
+                (workspace / "one.png").write_bytes(b"not a PNG")
+                (workspace / "two.png").write_bytes(b"not a PNG")
+                environment = {
+                    "APP_NAME": "Test App",
+                    "RUNNER_TEMP": str(root / "runner"),
+                    "GITHUB_OUTPUT": str(root / "outputs"),
+                    "DMG_BACKGROUND_PATH": "one.png",
+                    "DMG_BACKGROUND_2X_PATH": "two.png",
+                    "DMG_WINDOW_WIDTH": "680",
+                    "DMG_WINDOW_HEIGHT": "428",
+                    "DMG_ICON_SIZE": "120",
+                    "DMG_TEXT_SIZE": "13",
+                    "DMG_APP_X": "180",
+                    "DMG_APP_Y": "170",
+                    "DMG_APPLICATIONS_X": "500",
+                    "DMG_APPLICATIONS_Y": "170",
+                }
+                if case == "one-sided":
+                    environment["DMG_BACKGROUND_2X_PATH"] = ""
+                elif case == "traversal":
+                    environment["DMG_BACKGROUND_PATH"] = "../outside.png"
+                elif case == "symlink":
+                    (workspace / "link.png").symlink_to("one.png")
+                    environment["DMG_BACKGROUND_PATH"] = "link.png"
+                elif case == "missing":
+                    environment["DMG_BACKGROUND_PATH"] = "missing.png"
+                elif case == "not-directory":
+                    environment["DMG_BACKGROUND_PATH"] = "one.png/child.png"
+                elif case == "empty":
+                    (workspace / "one.png").write_bytes(b"")
+                elif case == "oversize":
+                    with (workspace / "one.png").open("wb") as stream:
+                        stream.truncate(20 * 1024 * 1024 + 1)
+                elif case in ("malformed-integer", "fractional", "negative", "too-wide",
+                              "app-below-content", "applications-below-content"):
+                    (workspace / "one.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                    (workspace / "two.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                if case == "malformed-integer":
+                    environment["DMG_WINDOW_WIDTH"] = "invalid"
+                elif case == "fractional":
+                    environment["DMG_ICON_SIZE"] = "120.5"
+                elif case == "negative":
+                    environment["DMG_APP_X"] = "-1"
+                elif case == "too-wide":
+                    environment["DMG_APPLICATIONS_X"] = "681"
+                elif case == "app-below-content":
+                    environment["DMG_APP_Y"] = "401"
+                elif case == "applications-below-content":
+                    environment["DMG_APPLICATIONS_Y"] = "401"
+                expected = {
+                    "one-sided": "Both 1x and 2x",
+                    "traversal": "safe relative path",
+                    "symlink": "symbolic links",
+                    "missing": "existing file",
+                    "not-directory": "existing file",
+                    "not-png": "PNG image",
+                    "empty": "non-empty file",
+                    "oversize": "no larger than 20 MiB",
+                    "malformed-integer": "must be an integer",
+                    "fractional": "must be an integer",
+                    "negative": "must be an integer",
+                    "too-wide": "outside the supported range",
+                    "app-below-content": "outside the supported range",
+                    "applications-below-content": "outside the supported range",
+                }[case]
+                with working_directory(workspace), self.assertRaisesRegex(RuntimeError, expected):
+                    execute_step("Package unsigned app and optional Finder layout", environment)
+                self.assertFalse((root / "runner/finder-layout.dmg").exists())
+
+    def test_nondefault_finder_geometry_accepts_matching_artwork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "caller"
+            workspace.mkdir()
+            app = root / "runner/native-build/Build/Products/Release/Test App.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(b"fixture")
+            write_png(workspace / "one.png", 500, 300)
+            write_png(workspace / "two.png", 1000, 600)
+            environment = {
+                "APP_NAME": "Test App",
+                "RUNNER_TEMP": str(root / "runner"),
+                "GITHUB_OUTPUT": str(root / "outputs"),
+                "DMG_BACKGROUND_PATH": "one.png",
+                "DMG_BACKGROUND_2X_PATH": "two.png",
+                "DMG_WINDOW_WIDTH": "500",
+                "DMG_WINDOW_HEIGHT": "328",
+                "DMG_ICON_SIZE": "80",
+                "DMG_TEXT_SIZE": "12",
+                "DMG_APP_X": "100",
+                "DMG_APP_Y": "150",
+                "DMG_APPLICATIONS_X": "400",
+                "DMG_APPLICATIONS_Y": "150",
+            }
+
+            def image_tools(arguments, **kwargs):
+                if arguments[0] == "/usr/bin/sips":
+                    dimensions = (500, 300) if arguments[-1].endswith("one.png") else (1000, 600)
+                    return subprocess.CompletedProcess(
+                        arguments, 0, f"pixelWidth: {dimensions[0]}\npixelHeight: {dimensions[1]}\n", ""
+                    )
+                if arguments[0] == "/usr/bin/tiffutil":
+                    Path(arguments[-1]).write_bytes(b"II*\x00")
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+                if arguments[:2] == ["/usr/bin/hdiutil", "create"]:
+                    raise RuntimeError("geometry accepted")
+                raise AssertionError(f"Unexpected command: {arguments}")
+
+            with working_directory(workspace), patch("subprocess.run", side_effect=image_tools):
+                with self.assertRaisesRegex(RuntimeError, "geometry accepted"):
+                    execute_step("Package unsigned app and optional Finder layout", environment)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Requires macOS image tools")
+    def test_incorrect_retina_artwork_dimensions_fail_before_creating_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "caller"
+            workspace.mkdir()
+            app = root / "runner/native-build/Build/Products/Release/Test App.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(b"fixture")
+            write_png(workspace / "one.png", 680, 400)
+            write_png(workspace / "two.png", 1360, 799)
+            environment = {
+                "APP_NAME": "Test App",
+                "RUNNER_TEMP": str(root / "runner"),
+                "GITHUB_OUTPUT": str(root / "outputs"),
+                "DMG_BACKGROUND_PATH": "one.png",
+                "DMG_BACKGROUND_2X_PATH": "two.png",
+                "DMG_WINDOW_WIDTH": "680",
+                "DMG_WINDOW_HEIGHT": "428",
+                "DMG_ICON_SIZE": "120",
+                "DMG_TEXT_SIZE": "13",
+                "DMG_APP_X": "180",
+                "DMG_APP_Y": "170",
+                "DMG_APPLICATIONS_X": "500",
+                "DMG_APPLICATIONS_Y": "170",
+            }
+            with working_directory(workspace), self.assertRaisesRegex(RuntimeError, "exact 1x/2x sizes"):
+                execute_step("Package unsigned app and optional Finder layout", environment)
+            self.assertFalse((root / "runner/finder-layout.dmg").exists())
+
+    def test_artifact_extraction_checks_cross_job_digest_and_exact_app_allowlist(self):
+        for tamper in (False, True):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "runner/native-input"
+                artifact.mkdir(parents=True)
+                app_prefix = "Test App.app"
+                archive_path = artifact / "unsigned-app.tar"
+                with tarfile.open(archive_path, "w") as archive:
+                    app = tarfile.TarInfo(app_prefix)
+                    app.type = tarfile.DIRTYPE
+                    archive.addfile(app)
+                    contents = tarfile.TarInfo(app_prefix + "/Contents")
+                    contents.type = tarfile.DIRTYPE
+                    archive.addfile(contents)
+                    payload = tarfile.TarInfo(app_prefix + "/Contents/Info.plist")
+                    payload.size = 7
+                    archive.addfile(payload, io.BytesIO(b"fixture"))
+                expected_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+                if tamper:
+                    with archive_path.open("ab") as stream:
+                        stream.write(b"altered")
+                environment = {
+                    "SIGNING_TEMP": str(root / "signing"),
+                    "RUNNER_TEMP": str(root / "runner"),
+                    "APP_NAME": "Test App",
+                    "DMG_LAYOUT_ENABLED": "false",
+                    "BUILD_LAYOUT_ENABLED": "false",
+                    "UNSIGNED_APP_SHA256": expected_hash,
+                    "FINDER_DS_STORE_SHA256": "",
+                    "FINDER_BACKGROUND_SHA256": "",
+                }
+                if tamper:
+                    with self.assertRaisesRegex(RuntimeError, "digest"):
+                        execute_step("Extract unsigned bundle", environment)
+                    self.assertFalse((root / "signing/products").exists())
+                else:
+                    execute_step("Extract unsigned bundle", environment)
+                    self.assertEqual((root / "signing/products/Test App.app/Contents/Info.plist").read_bytes(),
+                                     b"fixture")
+
+    def test_artifact_extraction_accepts_internal_hardlinks_and_rejects_escaping_targets(self):
+        for target in ("Test App.app/Contents/original", "../outside"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "runner/native-input"
+                artifact.mkdir(parents=True)
+                archive_path = artifact / "unsigned-app.tar"
+                with tarfile.open(archive_path, "w") as archive:
+                    app = tarfile.TarInfo("Test App.app")
+                    app.type = tarfile.DIRTYPE
+                    archive.addfile(app)
+                    contents = tarfile.TarInfo("Test App.app/Contents")
+                    contents.type = tarfile.DIRTYPE
+                    archive.addfile(contents)
+                    original = tarfile.TarInfo("Test App.app/Contents/original")
+                    original.size = 7
+                    archive.addfile(original, io.BytesIO(b"fixture"))
+                    link = tarfile.TarInfo("Test App.app/Contents/link")
+                    link.type = tarfile.LNKTYPE
+                    link.linkname = target
+                    archive.addfile(link)
+                environment = {
+                    "SIGNING_TEMP": str(root / "signing"),
+                    "RUNNER_TEMP": str(root / "runner"),
+                    "APP_NAME": "Test App",
+                    "DMG_LAYOUT_ENABLED": "false",
+                    "BUILD_LAYOUT_ENABLED": "false",
+                    "UNSIGNED_APP_SHA256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                    "FINDER_DS_STORE_SHA256": "",
+                    "FINDER_BACKGROUND_SHA256": "",
+                }
+                if target.startswith("../"):
+                    with self.assertRaisesRegex(RuntimeError, "unsafe hard link"):
+                        execute_step("Extract unsigned bundle", environment)
+                else:
+                    execute_step("Extract unsigned bundle", environment)
+                    contents = root / "signing/products/Test App.app/Contents"
+                    self.assertEqual((contents / "link").read_bytes(), b"fixture")
+                    self.assertTrue(os.path.samefile(contents / "link", contents / "original"))
+
+    def test_artifact_extraction_binds_custom_finder_metadata_to_build_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "runner/native-input"
+            metadata = artifact / "finder-layout"
+            background_dir = metadata / ".background"
+            background_dir.mkdir(parents=True)
+            archive_path = artifact / "unsigned-app.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                app_dir = tarfile.TarInfo("Test App.app")
+                app_dir.type = tarfile.DIRTYPE
+                archive.addfile(app_dir)
+            ds_store = metadata / ".DS_Store"
+            ds_store.write_bytes(b"\x00\x00\x00\x01Bud1" + bytes(8))
+            background = background_dir / "background.tiff"
+            background.write_bytes(b"II*\x00" + bytes(16))
+            environment = {
+                "SIGNING_TEMP": str(root / "signing"),
+                "RUNNER_TEMP": str(root / "runner"),
+                "APP_NAME": "Test App",
+                "DMG_LAYOUT_ENABLED": "true",
+                "BUILD_LAYOUT_ENABLED": "true",
+                "UNSIGNED_APP_SHA256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                "FINDER_DS_STORE_SHA256": hashlib.sha256(ds_store.read_bytes()).hexdigest(),
+                "FINDER_BACKGROUND_SHA256": hashlib.sha256(background.read_bytes()).hexdigest(),
+            }
+            execute_step("Extract unsigned bundle", environment)
+            self.assertTrue((root / "signing/products/Test App.app").is_dir())
+            shutil.rmtree(root / "signing")
+            background.write_bytes(b"II*\x00" + bytes(17))
+            with self.assertRaisesRegex(RuntimeError, "metadata digest"):
+                execute_step("Extract unsigned bundle", environment)
+
     def test_packaging_orders_both_notarizations_and_stops_on_failure(self):
         for failure in (None, "app-submit", "image-submit", "image-sign", "image-staple"):
             with self.subTest(failure=failure), native_fixture() as (root, app):
@@ -284,7 +772,8 @@ class NativeSigningTests(unittest.TestCase):
                 with patch.object(self.module, "run", side_effect=run), \
                         patch.object(self.module, "codesign", side_effect=codesign), \
                         patch.object(self.module, "import_identity", return_value=root / "signing.keychain-db"), \
-                        patch.object(self.module, "fetch_secret", return_value=secrets.token_hex(24)):
+                        patch.object(self.module, "fetch_secret", return_value=secrets.token_hex(24)), \
+                        patch.object(self.module, "verify_disk_image"):
                     if failure:
                         with self.assertRaises(RuntimeError):
                             self.module.main()
@@ -346,7 +835,8 @@ class NativeSigningTests(unittest.TestCase):
                                VAULT_URI="https://" + "synthetic-vault" + ".vault.azure.net",
                                APPLE_ID="synthetic@example.invalid", APPLE_TEAM_ID="SYNTHETIC0",
                                APPLE_SIGNING_IDENTITY="Developer ID Application: Fixture (SYNTHETIC0)",
-                               GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42")
+                               GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42",
+                               DMG_LAYOUT_ENABLED="false")
             with patch.dict(os.environ, environment), patch.object(self.module, "fetch_secret") as fetch:
                 with self.assertRaisesRegex(RuntimeError, "build version"):
                     self.module.main()
@@ -446,7 +936,8 @@ class NativeSigningTests(unittest.TestCase):
                                        VAULT_URI="https://" + "synthetic-vault" + ".vault.azure.net",
                                        APPLE_ID="synthetic@example.invalid", APPLE_TEAM_ID="SYNTHETIC0",
                                        APPLE_SIGNING_IDENTITY="Developer ID Application: Fixture (SYNTHETIC0)",
-                                       GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42")
+                                       GITHUB_REF_NAME="v1.2.3", GITHUB_RUN_NUMBER="42",
+                                       DMG_LAYOUT_ENABLED="false")
                     with patch.dict(os.environ, environment):
                         with patch.object(self.module, "import_identity", return_value=keychain):
                             with patch.object(self.module, "fetch_secret", return_value=password):
@@ -455,8 +946,10 @@ class NativeSigningTests(unittest.TestCase):
                                         with patch.object(self.module, "run", return_value=(
                                                 '"Developer ID Application: Fixture (SYNTHETIC0)"')):
                                             with patch.object(self.module, "codesign") as signing, \
-                                                    patch.object(self.module, "create_disk_image"), \
-                                                    patch.object(self.module, "submit_and_staple"):
+                                                    patch.object(self.module, "create_disk_image",
+                                                                 return_value=("fixture-digest", None)), \
+                                                    patch.object(self.module, "submit_and_staple"), \
+                                                    patch.object(self.module, "verify_disk_image"):
                                                 self.module.main()
                     self.assertEqual(signing.call_count, 8)
                     sign, verify, developer_id = signing.call_args_list[:3]
@@ -551,13 +1044,16 @@ class NativeSigningTests(unittest.TestCase):
 
             def run(arguments, **kwargs):
                 # The fixture has no Apple ticket. All file and image tools run for real.
-                if arguments[1:3] == ["stapler", "validate"]:
+                if (arguments[1:3] == ["stapler", "validate"]
+                        or arguments[:2] == ["/usr/sbin/spctl", "--assess"]):
                     return ""
                 return original_run(arguments, **kwargs)
 
             image = root / "Test App-v1.2.3-universal-macos.dmg"
             with patch.object(self.module, "run", side_effect=run):
                 self.module.create_disk_image(app, root, image)
+                expected_digest = self.module.bundle_digest(app)
+                self.module.verify_disk_image(image, app, root, expected_digest, None)
             self.module.codesign(["--force", "--sign", "-", "--timestamp=none"],
                                  operation="sign disk image", path=image, root=root)
             self.module.codesign(["--verify", "--strict"],
@@ -592,10 +1088,75 @@ class NativeSigningTests(unittest.TestCase):
                     (mount / "should-not-write").touch()
             finally:
                 if os.path.ismount(mount):
-                    result = subprocess.run(["/usr/bin/hdiutil", "detach", str(mount)], capture_output=True)
-                    if result.returncode:
-                        original_run(["/usr/bin/hdiutil", "detach", "-force", str(mount)])
+                    try:
+                        result = subprocess.run(["/usr/bin/hdiutil", "detach", str(mount)],
+                                                capture_output=True, timeout=120)
+                    except subprocess.TimeoutExpired:
+                        result = None
+                    if result is None or result.returncode:
+                        subprocess.run(["/usr/bin/hdiutil", "detach", "-force", str(mount)],
+                                       capture_output=True, timeout=120, check=True)
                     self.assertFalse(os.path.ismount(mount))
+
+    @unittest.skipUnless(sys.platform == "darwin", "Requires macOS disk image and code-signing tools")
+    def test_finder_payload_survives_fresh_compressed_image_and_readonly_verification(self):
+        with native_fixture() as (root, app):
+            info = app / "Contents/Info.plist"
+            info.write_bytes(plistlib.dumps({
+                **plistlib.loads(info.read_bytes()), "CFBundleIdentifier": "example.native.fixture",
+                "CFBundleExecutable": "Test", "CFBundlePackageType": "APPL",
+            }))
+            binary = app / "Contents/MacOS/Test"
+            binary.parent.mkdir()
+            shutil.copyfile("/usr/bin/true", binary)
+            binary.chmod(0o755)
+            (app / "Contents/binary-link").symlink_to("MacOS/Test")
+            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app)],
+                           capture_output=True, check=True)
+            subprocess.run(["/usr/bin/xattr", "-w", "com.example.fixture", "value", str(binary)],
+                           capture_output=True, check=True)
+
+            payload = root.parent / "native-input/finder-layout"
+            background_dir = payload / ".background"
+            background_dir.mkdir(parents=True)
+            ds_store = payload / ".DS_Store"
+            ds_store.write_bytes(b"\x00\x00\x00\x01Bud1" + bytes(8))
+            background = background_dir / "background.tiff"
+            background.write_bytes(b"II*\x00" + bytes(16))
+            expected_layout = (
+                hashlib.sha256(ds_store.read_bytes()).hexdigest(),
+                hashlib.sha256(background.read_bytes()).hexdigest(),
+            )
+            image = root.parent / "Finder Layout.dmg"
+
+            original_run = self.module.run
+
+            def run(arguments, **kwargs):
+                if (arguments[1:3] == ["stapler", "validate"]
+                        or arguments[:2] == ["/usr/sbin/spctl", "--assess"]):
+                    return ""
+                return original_run(arguments, **kwargs)
+
+            environment = {
+                "RUNNER_TEMP": str(root.parent),
+                "FINDER_DS_STORE_SHA256": expected_layout[0],
+                "FINDER_BACKGROUND_SHA256": expected_layout[1],
+            }
+            with patch.dict(os.environ, environment), patch.object(self.module, "run", side_effect=run):
+                previous_umask = os.umask(0o077)
+                try:
+                    expected_digest, actual_layout = self.module.create_disk_image(app, root, image, payload)
+                finally:
+                    os.umask(previous_umask)
+                self.assertEqual(actual_layout, expected_layout)
+                self.module.verify_disk_image(image, app, root, expected_digest, expected_layout)
+                with self.module.mounted_image(image, root / "metadata-mount", readonly=True):
+                    self.assertEqual(stat.S_IMODE((root / "metadata-mount/.background").stat().st_mode), 0o755)
+                    self.assertEqual(stat.S_IMODE((root / "metadata-mount/.DS_Store").stat().st_mode), 0o644)
+                    self.assertEqual(
+                        stat.S_IMODE((root / "metadata-mount/.background/background.tiff").stat().st_mode),
+                        0o644,
+                    )
 
 
 class NativePublicationTests(unittest.TestCase):
