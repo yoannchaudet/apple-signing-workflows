@@ -276,9 +276,9 @@ jobs:
               icon_size = integer("DMG_ICON_SIZE", 16, 512)
               text_size = integer("DMG_TEXT_SIZE", 8, 32)
               app_x = integer("DMG_APP_X", 0, width)
-              app_y = integer("DMG_APP_Y", 0, height)
+              app_y = integer("DMG_APP_Y", 0, height - 28)
               applications_x = integer("DMG_APPLICATIONS_X", 0, width)
-              applications_y = integer("DMG_APPLICATIONS_Y", 0, height)
+              applications_y = integer("DMG_APPLICATIONS_Y", 0, height - 28)
               one_width, one_height = png_size(one_x)
               two_width, two_height = png_size(two_x)
               if (one_width != width or two_width != width * 2 or two_height != one_height * 2
@@ -543,22 +543,30 @@ jobs:
           app_prefix = os.environ["APP_NAME"] + ".app"
           with tarfile.open(archive_path) as archive:
               members = archive.getmembers()
-              names = [member.name.rstrip("/") for member in members]
+              names = [pathlib.PurePosixPath(member.name).as_posix() for member in members]
               if len(names) != len(set(names)):
                   raise RuntimeError("The unsigned archive contains duplicate paths.")
+              regular_files = set()
               for member in members:
                   path = pathlib.PurePosixPath(member.name)
                   if (not path.parts or path.is_absolute() or "\\" in member.name
                           or ".." in path.parts or path.parts[0] != app_prefix
                           or path.name.startswith("._")):
                       raise RuntimeError("The unsigned archive contains an unexpected path.")
-                  if member.islnk() or not (member.isdir() or member.isfile() or member.issym()):
+                  if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
                       raise RuntimeError("The unsigned archive contains an unsupported filesystem entry.")
+                  if member.islnk():
+                      target = pathlib.PurePosixPath(member.linkname)
+                      if (target.is_absolute() or "\\" in member.linkname or ".." in target.parts
+                              or target.as_posix() not in regular_files):
+                          raise RuntimeError("The unsigned archive contains an unsafe hard link.")
                   if member.issym():
                       target = member.linkname
                       resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), target))
                       if target.startswith("/") or resolved != app_prefix and not resolved.startswith(app_prefix + "/"):
                           raise RuntimeError("The unsigned archive contains an escaping symbolic link.")
+                  if member.isfile():
+                      regular_files.add(path.as_posix())
               if not members or not any(member.name.rstrip("/") == app_prefix for member in members):
                   raise RuntimeError("The unsigned archive does not contain the requested application.")
               if any(pathlib.PurePosixPath(member.name).name.startswith("._") for member in members):

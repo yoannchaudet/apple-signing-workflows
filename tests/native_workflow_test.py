@@ -301,12 +301,12 @@ class NativeSigningTests(unittest.TestCase):
             self.assertNotEqual(first, self.module.bundle_digest(app))
             file.chmod(0o644)
             if hasattr(os, "setxattr"):
-                attribute = "com.apple.FinderInfo" if sys.platform == "darwin" else "user.marelle.fixture"
+                attribute = "com.apple.FinderInfo" if sys.platform == "darwin" else "user.fixture"
                 os.setxattr(file, attribute, bytes(32))
                 self.assertNotEqual(first, self.module.bundle_digest(app))
             elif sys.platform == "darwin":
                 subprocess.run([
-                    "/usr/bin/xattr", "-w", "com.example.marelle.fixture", "value", str(file),
+                    "/usr/bin/xattr", "-w", "com.example.fixture", "value", str(file),
                 ], check=True)
                 self.assertNotEqual(first, self.module.bundle_digest(app))
 
@@ -470,7 +470,8 @@ class NativeSigningTests(unittest.TestCase):
 
     def test_invalid_finder_artwork_inputs_fail_before_packaging(self):
         for case in ("one-sided", "traversal", "symlink", "missing", "not-directory", "not-png", "empty",
-                     "oversize", "malformed-integer"):
+                     "oversize", "malformed-integer", "fractional", "negative", "too-wide",
+                     "app-below-content", "applications-below-content"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 workspace = root / "caller"
@@ -511,10 +512,22 @@ class NativeSigningTests(unittest.TestCase):
                 elif case == "oversize":
                     with (workspace / "one.png").open("wb") as stream:
                         stream.truncate(20 * 1024 * 1024 + 1)
-                elif case == "malformed-integer":
+                elif case in ("malformed-integer", "fractional", "negative", "too-wide",
+                              "app-below-content", "applications-below-content"):
                     (workspace / "one.png").write_bytes(b"\x89PNG\r\n\x1a\n")
                     (workspace / "two.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                if case == "malformed-integer":
                     environment["DMG_WINDOW_WIDTH"] = "invalid"
+                elif case == "fractional":
+                    environment["DMG_ICON_SIZE"] = "120.5"
+                elif case == "negative":
+                    environment["DMG_APP_X"] = "-1"
+                elif case == "too-wide":
+                    environment["DMG_APPLICATIONS_X"] = "681"
+                elif case == "app-below-content":
+                    environment["DMG_APP_Y"] = "401"
+                elif case == "applications-below-content":
+                    environment["DMG_APPLICATIONS_Y"] = "401"
                 expected = {
                     "one-sided": "Both 1x and 2x",
                     "traversal": "safe relative path",
@@ -525,10 +538,58 @@ class NativeSigningTests(unittest.TestCase):
                     "empty": "non-empty file",
                     "oversize": "no larger than 20 MiB",
                     "malformed-integer": "must be an integer",
+                    "fractional": "must be an integer",
+                    "negative": "must be an integer",
+                    "too-wide": "outside the supported range",
+                    "app-below-content": "outside the supported range",
+                    "applications-below-content": "outside the supported range",
                 }[case]
                 with working_directory(workspace), self.assertRaisesRegex(RuntimeError, expected):
                     execute_step("Package unsigned app and optional Finder layout", environment)
                 self.assertFalse((root / "runner/finder-layout.dmg").exists())
+
+    def test_nondefault_finder_geometry_accepts_matching_artwork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "caller"
+            workspace.mkdir()
+            app = root / "runner/native-build/Build/Products/Release/Test App.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(b"fixture")
+            write_png(workspace / "one.png", 500, 300)
+            write_png(workspace / "two.png", 1000, 600)
+            environment = {
+                "APP_NAME": "Test App",
+                "RUNNER_TEMP": str(root / "runner"),
+                "GITHUB_OUTPUT": str(root / "outputs"),
+                "DMG_BACKGROUND_PATH": "one.png",
+                "DMG_BACKGROUND_2X_PATH": "two.png",
+                "DMG_WINDOW_WIDTH": "500",
+                "DMG_WINDOW_HEIGHT": "328",
+                "DMG_ICON_SIZE": "80",
+                "DMG_TEXT_SIZE": "12",
+                "DMG_APP_X": "100",
+                "DMG_APP_Y": "150",
+                "DMG_APPLICATIONS_X": "400",
+                "DMG_APPLICATIONS_Y": "150",
+            }
+
+            def image_tools(arguments, **kwargs):
+                if arguments[0] == "/usr/bin/sips":
+                    dimensions = (500, 300) if arguments[-1].endswith("one.png") else (1000, 600)
+                    return subprocess.CompletedProcess(
+                        arguments, 0, f"pixelWidth: {dimensions[0]}\npixelHeight: {dimensions[1]}\n", ""
+                    )
+                if arguments[0] == "/usr/bin/tiffutil":
+                    Path(arguments[-1]).write_bytes(b"II*\x00")
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+                if arguments[:2] == ["/usr/bin/hdiutil", "create"]:
+                    raise RuntimeError("geometry accepted")
+                raise AssertionError(f"Unexpected command: {arguments}")
+
+            with working_directory(workspace), patch("subprocess.run", side_effect=image_tools):
+                with self.assertRaisesRegex(RuntimeError, "geometry accepted"):
+                    execute_step("Package unsigned app and optional Finder layout", environment)
 
     @unittest.skipUnless(sys.platform == "darwin", "Requires macOS image tools")
     def test_incorrect_retina_artwork_dimensions_fail_before_creating_image(self):
@@ -600,6 +661,46 @@ class NativeSigningTests(unittest.TestCase):
                     execute_step("Extract unsigned bundle", environment)
                     self.assertEqual((root / "signing/products/Test App.app/Contents/Info.plist").read_bytes(),
                                      b"fixture")
+
+    def test_artifact_extraction_accepts_internal_hardlinks_and_rejects_escaping_targets(self):
+        for target in ("Test App.app/Contents/original", "../outside"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "runner/native-input"
+                artifact.mkdir(parents=True)
+                archive_path = artifact / "unsigned-app.tar"
+                with tarfile.open(archive_path, "w") as archive:
+                    app = tarfile.TarInfo("Test App.app")
+                    app.type = tarfile.DIRTYPE
+                    archive.addfile(app)
+                    contents = tarfile.TarInfo("Test App.app/Contents")
+                    contents.type = tarfile.DIRTYPE
+                    archive.addfile(contents)
+                    original = tarfile.TarInfo("Test App.app/Contents/original")
+                    original.size = 7
+                    archive.addfile(original, io.BytesIO(b"fixture"))
+                    link = tarfile.TarInfo("Test App.app/Contents/link")
+                    link.type = tarfile.LNKTYPE
+                    link.linkname = target
+                    archive.addfile(link)
+                environment = {
+                    "SIGNING_TEMP": str(root / "signing"),
+                    "RUNNER_TEMP": str(root / "runner"),
+                    "APP_NAME": "Test App",
+                    "DMG_LAYOUT_ENABLED": "false",
+                    "BUILD_LAYOUT_ENABLED": "false",
+                    "UNSIGNED_APP_SHA256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                    "FINDER_DS_STORE_SHA256": "",
+                    "FINDER_BACKGROUND_SHA256": "",
+                }
+                if target.startswith("../"):
+                    with self.assertRaisesRegex(RuntimeError, "unsafe hard link"):
+                        execute_step("Extract unsigned bundle", environment)
+                else:
+                    execute_step("Extract unsigned bundle", environment)
+                    contents = root / "signing/products/Test App.app/Contents"
+                    self.assertEqual((contents / "link").read_bytes(), b"fixture")
+                    self.assertTrue(os.path.samefile(contents / "link", contents / "original"))
 
     def test_artifact_extraction_binds_custom_finder_metadata_to_build_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1009,7 +1110,10 @@ class NativeSigningTests(unittest.TestCase):
             binary.parent.mkdir()
             shutil.copyfile("/usr/bin/true", binary)
             binary.chmod(0o755)
+            (app / "Contents/binary-link").symlink_to("MacOS/Test")
             subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app)],
+                           capture_output=True, check=True)
+            subprocess.run(["/usr/bin/xattr", "-w", "com.example.fixture", "value", str(binary)],
                            capture_output=True, check=True)
 
             payload = root.parent / "native-input/finder-layout"

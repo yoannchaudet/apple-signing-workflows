@@ -101,7 +101,8 @@ Replace `WORKFLOW_COMMIT_SHA` with the full reviewed commit SHA after that commi
 published to this repository. A local commit is not available to GitHub Actions. If a
 caller is public, this repository must also be public before that caller can use it.
 Omit both background inputs to keep the existing headless DMG layout. Artwork paths are
-relative to `working-directory`; provide both 1x and 2x PNGs.
+relative to `working-directory`; provide both 1x and 2x PNGs. The defaults below
+expect 680×400 and 1360×800 images; set the layout inputs for different artwork.
 
 The native workflow accepts these inputs:
 
@@ -144,10 +145,15 @@ distributable directory and file permissions. With no background inputs, the DMG
 retains its existing headless `hdiutil` layout. When artwork is enabled, the no-secret
 macOS build job validates both regular PNG files (each at most 20 MiB), combines them
 into a multi-resolution TIFF with the system `tiffutil`, and uses Finder to save and
-reopen a read-write layout image. The persisted layout has a 680×400-point background,
-a 680×428-point window, 120-point icons, 13-point labels, app and Applications centers
-at (180,170) and (500,170), and no toolbar, sidebar, status bar, or path bar. The extra
-28 points account for Finder's title bar. The `.DS_Store` and
+reopen a read-write layout image. The 1x image width must equal the window width; its
+height must fit within the window height minus 28 points for Finder's title bar. The
+2x image must have exactly twice both dimensions. Window width must be an integer from
+160 to 10000 and height from 100 to 10000; icon size must be from 16 to 512 and text
+size from 8 to 32. Icon center coordinates must be integers within the window width
+and usable height, inclusive. Finder must also be able to persist the requested bounds
+and settings on the runner's display. The default layout has a 680×428-point window,
+120-point icons, 13-point labels, app and Applications centers at (180,170) and
+(500,170), and no toolbar, sidebar, status bar, or path bar. The `.DS_Store` and
 `.background/background.tiff` payloads are transferred with SHA-256 checks. The
 signing job creates a fresh compressed image from the verified app and those files,
 without mounting a caller-produced image or running Finder. Finder automation is
